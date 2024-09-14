@@ -371,7 +371,7 @@ The behavior of the feedback system differs slightly between public channels and
 
 ### Timeout Behavior
 
-- Feedback buttons automatically become inactive slightly before the Discord interaction 
+- Feedback buttons automatically become inactive slightly before the original Discord interaction 
   token expires (approximately 15 minutes).
 - In both public/private channels, all buttons are removed except those buttons
   which were selected by users. Those remaining buttons will remain visible, but
