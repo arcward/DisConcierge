@@ -143,7 +143,7 @@ describe('App Component', () => {
             // debug();
 
             expect(screen.getByText('Go to Users')).toBeInTheDocument();
-            expect(screen.getByText('Go to Commands')).toBeInTheDocument();
+            expect(screen.getByText('Go to Configure')).toBeInTheDocument();
 
         });
 

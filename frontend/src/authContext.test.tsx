@@ -36,13 +36,10 @@ describe('AuthProvider', () => {
             render(
                 <ThemeProvider theme={theme}>
                     <Router>
-
                         <AuthProvider>
-
                             <TestComponent/>
                         </AuthProvider>
                     </Router>
-
                 </ThemeProvider>
             );
         });
