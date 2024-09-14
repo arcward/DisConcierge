@@ -102,7 +102,6 @@ func TestUnmarshalConfig(t *testing.T) {
 			envPrefix,
 		): "Content-Type Authorization",
 
-		fmt.Sprintf("%s_OPENAI_VECTOR_STORE_ID", envPrefix):   "vs-foo",
 		fmt.Sprintf("%s_API_SECRET", envPrefix):               "somesecret",
 		fmt.Sprintf("%s_API_MAX_MULTIPART_MEMORY", envPrefix): "256",
 
@@ -138,8 +137,7 @@ func TestUnmarshalConfig(t *testing.T) {
 	assert.Equal(t, 200, viper.GetInt("queue.size"))
 	assert.Equal(t, "5m", viper.GetString("queue.max_age"))
 	assert.Equal(t, "test-token", viper.GetString("openai.token"))
-	assert.Equal(t, "assistant-id", viper.GetString("openai.assistant.id"))
-	assert.Equal(t, "vs-foo", viper.GetString("openai.vector_store_id"))
+	assert.Equal(t, "assistant-id", viper.GetString("openai.assistant_id"))
 	assert.Equal(t, "discord-token", viper.GetString("discord.token"))
 	assert.Equal(t, "somesecret", viper.GetString("api.secret"))
 	assert.ElementsMatch(
@@ -296,7 +294,6 @@ openai:
   token: your_openai_token_here
   log_level: INFO
   assistant_id: your_assistant_id_here
-  vector_store_id: your_vector_store_id_here
 discord:
   token: your_discord_token_here
   application_id: your_discord_application_id_here
@@ -330,6 +327,7 @@ api:
   secret: your_api_secret_here
   log_level: INFO
   cors:
+    max_age: 12h
     allow_origins: []
     allow_methods:
       - GET
@@ -359,8 +357,6 @@ api:
       - Authorization
       - Last-Modified
     allow_credentials: true
-    max_age: 12h
-  max_multipart_memory: 33554432
   read_timeout: 5s
   read_header_timeout: 5s
   write_timeout: 10s

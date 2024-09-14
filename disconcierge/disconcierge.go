@@ -988,8 +988,6 @@ func (d *DisConcierge) discordInit(
 }
 
 func (d *DisConcierge) startWebhookServer(ctx context.Context, runtimeWG *sync.WaitGroup) {
-	// TODO set up a run mode where only the API and database
-	//   are enabled (ex: for 'offline' bot config)
 	runtimeWG.Add(1)
 	go func() {
 		defer runtimeWG.Done()

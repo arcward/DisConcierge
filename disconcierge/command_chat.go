@@ -857,7 +857,6 @@ func (c *ChatCommand) newDMReport(
 // any non-nil buttons. Nil buttons indicate the button should not be included in the
 // final message components.
 func (c *ChatCommand) discordUserFeedbackComponents() []discordgo.MessageComponent {
-	// TODO check if BOT_DM or home guild
 	buttons := make([]discordgo.MessageComponent, 0, discordMaxButtonsPerActionRow)
 
 	goodButton := c.GoodButton()
@@ -1992,9 +1991,7 @@ func (c *ChatCommand) finalizeExpiredButtons(ctx context.Context, db DBI) {
 	} else {
 		if err := c.setExpiredButtonStatesFromDB(ctx, db.DB()); err != nil {
 			logger.ErrorContext(
-				ctx,
-				"error setting expired buttons",
-				tint.Err(err),
+				ctx, "error setting expired buttons", tint.Err(err),
 			)
 			return
 		}

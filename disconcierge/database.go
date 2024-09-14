@@ -216,13 +216,8 @@ func (d *database) GetOrCreateUser(
 	}
 
 	if user, cachedUser := d.userCache[u.ID]; cachedUser {
-		// FIXME this is fine for a single bot instance, but if multiple
-		//   instances are running, this can result in multiple updates
-		//   to the same user record as instances find their cached user
-		//   details are out of date. This also isn't particularly
-		//   concurrency-safe, as the cached record may be read by another
-		//   goroutine while we're updating it.
-
+		// FIXME This isn't particularly concurrency-safe, as the cached
+		//  record may be read by another goroutine while we're updating it.
 		log.InfoContext(ctx, "found existing user", "user", user)
 		user.LastSeen = time.Now().UTC().UnixMilli()
 		updates := map[string]any{columnUserLastSeen: user.LastSeen}

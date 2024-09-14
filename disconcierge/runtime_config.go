@@ -71,7 +71,7 @@ type RuntimeConfig struct {
 
 	// OpenAIMaxRequestsPerSecond is the rate limit for how many OpenAI "Create Run"
 	// API requests can be made per second
-	// TODO give this a clearer name
+	// TODO give this a clearer name, as it only applies to 'Create Run' requests
 	OpenAIMaxRequestsPerSecond int `gorm:"column:openai_max_requests_per_second;default:1" json:"openai_max_requests_per_second" binding:"min=1"`
 
 	// Limits the number of ChatCommands requests per user per 6-hour window

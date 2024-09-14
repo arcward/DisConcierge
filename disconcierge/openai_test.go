@@ -639,22 +639,6 @@ func (m *mockOpenAIPollingClient) RetrieveRun(
 //
 //   - ListRunStepsError: Map of run IDs to errors for ListRunSteps calls.
 //
-//   - RetrieveVectorStoreFileResponse: Map of file IDs to mock VectorStoreFile responses.
-//
-//   - RetrieveVectorStoreFileError: Map of file IDs to errors for RetrieveVectorStoreFile calls.
-//
-//   - DeleteVectorStoreFileResponse: Map of file IDs to errors for DeleteVectorStoreFile calls.
-//
-//   - DeleteFileResponse: Map of file IDs to errors for DeleteFile calls.
-//
-//   - CreateVectorStoreFileResponse: Map of file IDs to mock VectorStoreFile responses.
-//
-//   - CreateVectorStoreFileError: Map of file IDs to errors for CreateVectorStoreFile calls.
-//
-//   - RetrieveVectorStoreResponse: Map of vector store IDs to mock VectorStore responses.
-//
-//   - RetrieveVectorStoreError: Map of vector store IDs to errors for RetrieveVectorStore calls.
-//
 //   - PromptResponses: Map of prompts to predefined responses.
 //
 //   - ids: Pointer to commandData for generating unique IDs.
@@ -1438,75 +1422,6 @@ func (m *mockOpenAIClientServer) newRun(
 		CreatedAt:           time.Now().Unix(),
 	}
 	return run
-}
-
-func (*mockOpenAIClientServer) CreateFileBytes(
-	_ context.Context,
-	_ openai.FileBytesRequest,
-) (file openai.File, err error) {
-	return file, err
-}
-
-func (*mockOpenAIClientServer) CreateVectorStoreFile(
-	_ context.Context,
-	_ string,
-	_ openai.VectorStoreFileRequest,
-) (response openai.VectorStoreFile, err error) {
-	return response, err
-}
-
-func (*mockOpenAIClientServer) DeleteVectorStoreFile(
-	_ context.Context,
-	_ string,
-	_ string,
-) (err error) {
-	return err
-}
-
-func (*mockOpenAIClientServer) ListVectorStoreFiles(
-	_ context.Context,
-	_ string,
-	_ openai.Pagination,
-) (response openai.VectorStoreFilesList, err error) {
-	return response, err
-}
-
-func (*mockOpenAIClientServer) ListVectorStores(
-	_ context.Context,
-	_ openai.Pagination,
-) (response openai.VectorStoresList, err error) {
-	return response, err
-}
-
-func (*mockOpenAIClientServer) DeleteFile(
-	_ context.Context,
-	_ string,
-) (err error) {
-	// TODO implement me
-	return err
-}
-
-func (*mockOpenAIClientServer) RetrieveVectorStoreFile(
-	_ context.Context,
-	_ string,
-	_ string,
-) (response openai.VectorStoreFile, err error) {
-	return response, err
-}
-
-func (*mockOpenAIClientServer) RetrieveVectorStore(
-	_ context.Context,
-	_ string,
-) (response openai.VectorStore, err error) {
-	// TODO implement me
-	panic("implement me")
-}
-
-func (*mockOpenAIClientServer) CreateFile(
-	_ context.Context,
-	_ openai.FileRequest,
-) (file openai.File, err error) {
-	return file, err
 }
 
 func newOpenAIMessageList(

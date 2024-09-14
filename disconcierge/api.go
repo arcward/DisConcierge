@@ -730,7 +730,6 @@ func (h *APIHandlers) reloadUsers(c *gin.Context) {
 //   - 400 Bad Request: If the query parameters are invalid.
 //   - 500 Internal Server Error: If there is an error retrieving the users.
 func (h *APIHandlers) getUsers(c *gin.Context) {
-	// TODO: Paginate this on the backend and frontend
 	var pagination GetUsersQuery
 	if c.ShouldBindQuery(&pagination) != nil {
 		c.JSON(http.StatusBadRequest, httpError{Error: "invalid pagination"})

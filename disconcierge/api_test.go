@@ -2149,6 +2149,7 @@ func TestAPI_UpdateConfig_DiscordGateway(t *testing.T) {
 			expectedCalls: []string{"SetIdentify", "Open"},
 		},
 		{
+			// FIXME This test is flaky (fails intermittently)
 			name: "Update Custom Status",
 			initialState: func() RuntimeConfig {
 				cfg := baseConfig
