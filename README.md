@@ -1,23 +1,22 @@
 # DisConcierge
 
 DisConcierge is a Discord bot that allows users to interact with
-OpenAI assistants via Discord slash commands. 
-It features a web-based admin interface, custom slash commands, 
-and configurable settings for enhanced user interaction.
+OpenAI assistants via Discord slash commands. It also features a
+web-based admin interface for configuration and monitoring.
 
 ## Features
 
 - Discord slash commands (`/chat` and `/private`) to interact with your OpenAI assistant
 - Web-based admin interface for configuration and monitoring
 - User-specific settings and rate limiting (command limits per 6 hours)
-  and the ability to prioritize/ignore specific users)
+  and the ability to prioritize/ignore specific users.
 - Feedback system for user responses (Discord message components that allow
   users to indicate the bot's response was good/outdated/inaccurate, or to
   provide specific feedback via text modal)
-- Configurable logging levels
+- Configurable logging levels (adjustable "live" - no restart required)
 - Database logging of OpenAI API calls and Discord interactions
 - Support for both **SQLite** and **PostgreSQL** databases (*Note*: SQLite
-  is the default, and most tested. PostgreSQL support is 'experimental')
+  is the default, and most tested. PostgreSQL support is experimental)
 
 ![](./disconcierge-256x256.png)
 
@@ -291,6 +290,10 @@ to the admin interface (ex: `https://127.0.0.1:5000/admin`) and set
 an admin username/password before the bot will finish starting up:
 
 ![](./docs/ui_setup.PNG)
+
+**Note**: If your slash commands aren't showing up in Discord (after restarting
+your client), you may need to register them again. This can be done in the
+admin interface under "Actions" -> "Register Discord Commands".
 
 ## Usage
 
