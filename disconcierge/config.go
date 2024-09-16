@@ -2,7 +2,6 @@
 package disconcierge
 
 import (
-	"crypto/tls"
 	"github.com/bwmarrin/discordgo"
 	"github.com/gin-contrib/cors"
 	openai "github.com/sashabaranov/go-openai"
@@ -18,7 +17,7 @@ const (
 	DefaultRequestLimit6h             = 10
 	DefaultDatabaseType               = "sqlite"
 	DefaultDatabase                   = "disconcierge.sqlite3"
-	DefaultLogLevel                   = slog.LevelInfo
+	DefaultLogLevel                   = slog.LevelWarn
 	DefaultStartupTimeout             = 30 * time.Second
 	DefaultShutdownTimeout            = 60 * time.Second
 	DefaultOpenAIPollInterval         = 3 * time.Second
@@ -39,12 +38,11 @@ const (
 	DiscordSlashCommandPrivate                 = "private"
 	DefaultDiscordPrivateCommandDescription    = "Chat with me, but only you can see your message or my response"
 	DefaultDiscordWebhookServerListen          = "127.0.0.1:5001"
-	DefaultDiscordWebhookServerTLSminVersion   = tls.VersionTLS12
 	DefaultDiscordGatewayIntent                = discordgo.IntentsAllWithoutPrivileged
 
 	DiscordSlashCommandClear        = "clear"
 	DefaultDiscordQuestionMaxLength = 0
-	DefaultDiscordWebhookLogLevel   = slog.LevelInfo
+	DefaultDiscordWebhookLogLevel   = slog.LevelWarn
 	DefaultDiscordLogLevel          = slog.LevelWarn
 	DefaultDiscordErrorMessage      = "sorry, something went wrong!"
 	DefaultDiscordRateLimitMessage  = "I'm still working on your last message!"
@@ -52,7 +50,6 @@ const (
 	DefaultDiscordStartupMessage    = "I'm here!"
 	discordMaxMessageLength         = 2000
 	DefaultAPIListen                = "127.0.0.1:5000"
-	DefaultUITLSMinVersion          = tls.VersionTLS12
 	DefaultQueueSleepEmpty          = 1 * time.Second
 	DefaultQueueSleepPaused         = 5 * time.Second
 	DefaultQueueSize                = 100
@@ -60,11 +57,10 @@ const (
 	DefaultAPISessionMaxAge         = 6 * time.Hour
 
 	DefaultDatabaseSlowThreshold   = 200 * time.Millisecond
-	DefaultDatabaseLogLevel        = slog.LevelInfo
+	DefaultDatabaseLogLevel        = slog.LevelWarn
 	DefaultDiscordgoLogLevel       = slog.LevelWarn
-	DefaultOpenAILogLevel          = slog.LevelInfo
-	DefaultAPILogLevel             = slog.LevelInfo
-	defaultListenNetwork           = "tcp"
+	DefaultOpenAILogLevel          = slog.LevelWarn
+	DefaultAPILogLevel             = slog.LevelWarn
 	DefaultAPICORSAllowCredentials = true
 
 	DefaultRuntimeConfigTTL = 5 * time.Minute
@@ -164,19 +160,22 @@ type Config struct {
 	// primarily useful when running multiple instances.
 	UserCacheTTL time.Duration `yaml:"user_cache_ttl" mapstructure:"user_cache_ttl" json:"user_cache_ttl"`
 
-	HTTPClient *http.Client `log:"[redacted]"`
-}
+	// Development, if true, has the following affects:
+	//
+	// For the backend API:
+	// - The `gin.Recovery` middleware will **not** be used, allowing
+	//   panics to bubble up to the caller.
+	// - The session cookie's SameSite attribute will be set to None.
+	// - If `api.cors.allow_origin` isn't set, it will be set to "*".
+	// - pprof will be enabled at `/debug`
+	//
+	// For the webhook server (if enabled):
+	// - The `gin.Recovery` middleware will **not** be used
+	//
+	// (Note: This does not affect [RuntimeConfig.RecoverPanic]
+	Development bool `yaml:"development" mapstructure:"development" json:"development"`
 
-type CrawlerConfig struct {
-	Enabled                    bool          `yaml:"enabled" mapstructure:"enabled" json:"enabled"`
-	URL                        string        `yaml:"url" mapstructure:"url" json:"url"`
-	DataDir                    string        `yaml:"data_dir" mapstructure:"data_dir" json:"data_dir" binding:"required_if=Enabled true"`
-	FilePollInterval           time.Duration `yaml:"file_poll_interval" mapstructure:"file_poll_interval" json:"file_poll_interval" binding:"required_if=Enabled true"`
-	UploadMissingEmbeddedFiles bool          `yaml:"upload_missing_embedded_files" mapstructure:"upload_missing_embedded_files" json:"upload_missing_embedded_files"`
-}
-
-func (c Config) LogValue() slog.Value {
-	return structToSlogValue(c)
+	HTTPClient *http.Client `yaml:"-" json:"-" mapstructure:"-" log:"[redacted]"`
 }
 
 // QueueConfig configures the capacity and behavior of the ChatCommand queue.
@@ -260,11 +259,8 @@ type DiscordWebhookServerConfig struct {
 	// The address and port on which the server should listen (e.g., "127.0.0.1:5001").
 	Listen string `yaml:"listen" mapstructure:"listen" json:"listen" binding:"required_if=Enabled true,hostname|filepath"`
 
-	// The network type for listening (e.g., "tcp", "tcp4", "tcp6", "unix").
-	ListenNetwork string `yaml:"listen_network" mapstructure:"listen_network" json:"listen_network" binding:"required_if=Enabled true,oneof=tcp tcp4 tcp6 unix"`
-
 	// Configuration for SSL/TLS.
-	SSL SSLConfig `yaml:"ssl" mapstructure:"ssl" json:"ssl"`
+	SSL *SSLConfig `yaml:"ssl" mapstructure:"ssl" json:"ssl"`
 
 	// The public key used for verifying Discord interaction POST requests.
 	// In the Discord dev portal for your bot, this is under 'General Information'
@@ -300,17 +296,16 @@ type OpenAIConfig struct {
 
 // APIConfig configures the backend API server
 type APIConfig struct {
-	// The address and port on which the server should listen (e.g., "127.0.0.1:5001").
-	Listen string `yaml:"listen" mapstructure:"listen" json:"listen" binding:"required_if=Enabled true,hostname|filepath"`
+	ExternalURL string `yaml:"external_url" mapstructure:"external_url" json:"external_url" binding:"omitempty,http_url"`
 
-	// The network type for listening (e.g., "tcp", "tcp4", "tcp6", "unix").
-	ListenNetwork string `yaml:"listen_network" mapstructure:"listen_network" json:"listen_network" binding:"required_if=Enabled true,oneof=tcp tcp4 tcp6 unix"`
+	// The address and port on which the server should listen (e.g., "127.0.0.1:5001").
+	Listen string `yaml:"listen" mapstructure:"listen" json:"listen" binding:"hostname|filepath"`
 
 	// Secret used for signing cookies
 	Secret string `yaml:"secret" mapstructure:"secret" json:"secret" log:"[redacted]"`
 
 	// Configuration for SSL/TLS.
-	SSL SSLConfig `yaml:"ssl" mapstructure:"ssl" json:"ssl"`
+	SSL *SSLConfig `yaml:"ssl" mapstructure:"ssl" json:"ssl"`
 
 	// The logging level for the API server.
 	LogLevel *slog.LevelVar `yaml:"log_level" mapstructure:"log_level" json:"log_level"`
@@ -332,18 +327,18 @@ type APIConfig struct {
 
 	// Max age for session cookies
 	SessionMaxAge time.Duration `yaml:"session_max_age" mapstructure:"session_max_age" json:"session_max_age"  binding:"required_if=Enabled true,min=10m,max=24h"`
-
-	// If true, the SameSite attribute of the session cookie will be set to 'None'
-	Development bool `yaml:"development" mapstructure:"development" json:"development"`
 }
 
 // SSLConfig specifies cert paths and the TLS version to use
 type SSLConfig struct {
 	// Path to an SSL certificate
-	Cert string `yaml:"cert" mapstructure:"cert" json:"cert"`
+	CertFile string `yaml:"cert_file" mapstructure:"cert_file" json:"cert_file" binding:"omitempty,file"`
 
 	// Path to an SSL cert key
-	Key string `yaml:"key" mapstructure:"key" json:"key"`
+	KeyFile string `yaml:"key_file" mapstructure:"key_file" json:"key_file" binding:"omitempty,file"`
+
+	CertPEM string `yaml:"-" json:"-" mapstructure:"cert_pem" log:"[redacted]"`
+	KeyPEM  string `yaml:"-" json:"-" mapstructure:"key_pem" log:"[redacted]"`
 
 	// Minimum TLS version
 	TLSMinVersion uint16 `yaml:"tls_min_version" mapstructure:"tls_min_version" json:"tls_min_version"`
@@ -429,12 +424,9 @@ func DefaultConfig() *Config {
 		},
 		Discord: &DiscordConfig{
 			WebhookServer: DiscordWebhookServerConfig{
-				Enabled:       false,
-				Listen:        DefaultDiscordWebhookServerListen,
-				ListenNetwork: defaultListenNetwork,
-				SSL: SSLConfig{
-					TLSMinVersion: DefaultDiscordWebhookServerTLSminVersion,
-				},
+				Enabled:           false,
+				Listen:            DefaultDiscordWebhookServerListen,
+				SSL:               nil,
 				LogLevel:          discordWebhookLogLevel,
 				ReadHeaderTimeout: DefaultReadHeaderTimeout,
 				ReadTimeout:       DefaultReadTimeout,
@@ -447,11 +439,8 @@ func DefaultConfig() *Config {
 			StartupMessage:    DefaultDiscordStartupMessage,
 		},
 		API: &APIConfig{
-			Listen:        DefaultAPIListen,
-			ListenNetwork: defaultListenNetwork,
-			SSL: SSLConfig{
-				TLSMinVersion: DefaultUITLSMinVersion,
-			},
+			Listen:            DefaultAPIListen,
+			SSL:               nil,
 			LogLevel:          apiLogLevel,
 			ReadHeaderTimeout: DefaultReadHeaderTimeout,
 			ReadTimeout:       DefaultReadTimeout,

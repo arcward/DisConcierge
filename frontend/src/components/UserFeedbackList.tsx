@@ -20,8 +20,10 @@ import {
 import {UserFeedbackResponse}                    from '../models/UserFeedback';
 import api                                       from '../api/apiClient';
 import ChatCommandDetail                               from '../models/ChatCommandDetail';
+import {useNavigate} from "react-router-dom";
 
 const UserFeedbackList: React.FC = () => {
+    const history = useNavigate();
     const [userFeedbackResponse, setUserFeedbackResponse] = useState<UserFeedbackResponse | null>(
         null);
     const [loading, setLoading] = useState(true);
@@ -31,16 +33,6 @@ const UserFeedbackList: React.FC = () => {
     const [dialogOpen, setDialogOpen] = useState(false);
 
     const LIMIT = 25;
-
-    const handleChatCommandClick = async (id: number) => {
-        try {
-            const chatCommand = await api.getChatCommand(id.toString());
-            setSelectedChatCommand(chatCommand);
-            setDialogOpen(true);
-        } catch (error) {
-            console.error('Error fetching chat command:', error);
-        }
-    };
 
     const handleCloseDialog = () => {
         setDialogOpen(false);
@@ -103,19 +95,23 @@ const UserFeedbackList: React.FC = () => {
                             <TableCell>User ID</TableCell>
                             <TableCell>Type</TableCell>
                             <TableCell>Description</TableCell>
-                            <TableCell>Detail</TableCell>
                             <TableCell>Created At</TableCell>
                         </TableRow>
                     </TableHead>
                     <TableBody>
                         {userFeedbackResponse.feedback.map((feedback) => (
                             <TableRow key={feedback.id}>
-                                <TableCell>{feedback.id}</TableCell>
+                                <TableCell><Link
+                                    component="button"
+                                    variant="body2"
+                                    onClick={() => history(`/user_feedback/${feedback.id}`)}
+                                >{feedback.id}
+                                </Link></TableCell>
                                 <TableCell>
                                     <Link
                                         component="button"
                                         variant="body2"
-                                        onClick={() => handleChatCommandClick(feedback.chat_command_id)}
+                                        onClick={() => history(`/chat_command/${feedback.chat_command_id}`)}
                                     >
                                         {feedback.chat_command_id}
                                     </Link>
@@ -123,7 +119,6 @@ const UserFeedbackList: React.FC = () => {
                                 <TableCell>{feedback.user_id}</TableCell>
                                 <TableCell>{feedback.type}</TableCell>
                                 <TableCell>{feedback.description}</TableCell>
-                                <TableCell>{feedback.detail}</TableCell>
                                 <TableCell>{new Date(feedback.created_at).toLocaleString()}</TableCell>
                             </TableRow>
                         ))}

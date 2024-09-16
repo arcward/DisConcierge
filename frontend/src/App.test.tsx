@@ -8,7 +8,6 @@ import api                       from './api/apiClient';
 
 jest.mock('./api/apiClient', () => {
     return {
-        setupRequired: jest.fn().mockResolvedValue({required: false}),
         loggedIn: jest.fn().mockResolvedValue({username: 'testuser'}),
     }
 })
@@ -46,7 +45,7 @@ describe('App Component', () => {
             login: jest.fn(),
             logout: jest.fn(),
             username: 'testuser',
-            setupRequired: false,
+
         });
 
         renderApp();
@@ -60,7 +59,6 @@ describe('App Component', () => {
             login: jest.fn(),
             logout: jest.fn(),
             username: null,
-            setupRequired: false,
         });
 
         const {debug} = renderApp(['/login']);
@@ -87,7 +85,6 @@ describe('App Component', () => {
             login: jest.fn(),
             logout: jest.fn(),
             username: 'testuser',
-            setupRequired: false,
         });
 
         renderApp(['/login']);
@@ -109,7 +106,6 @@ describe('App Component', () => {
             login: jest.fn(),
             logout: jest.fn(),
             username: null,
-            setupRequired: false,
         });
 
         renderApp(['/config']);
@@ -123,7 +119,6 @@ describe('App Component', () => {
             login: jest.fn(),
             logout: jest.fn(),
             username: 'testuser',
-            setupRequired: false,
         });
 
 
@@ -149,30 +144,4 @@ describe('App Component', () => {
 
     });
 
-    test('renders FirstTimeSetup component when setup is required', async () => {
-        (api.setupRequired as jest.Mock).mockResolvedValue({required: true});
-        (useAuth as jest.Mock).mockReturnValue({
-            isAuthenticated: false,
-            login: jest.fn(),
-            logout: jest.fn(),
-            username: null,
-            setupRequired: true,
-        });
-
-
-        const {debug} = renderApp();
-        debug();
-        await waitFor(() => {
-            const setupTitle = screen.getByText('First-Time Setup');
-            expect(setupTitle).toBeInTheDocument();
-
-            expect(screen.getByLabelText(/username/i)).toBeInTheDocument();
-            // expect(screen.getByLabelText(/Password/)).toBeInTheDocument();
-            expect(screen.getByLabelText(/confirm password/i)).toBeInTheDocument();
-            expect(screen.getByRole('button', {name: /create admin user/i})).toBeInTheDocument();
-
-            debug();
-        });
-
-    });
 });

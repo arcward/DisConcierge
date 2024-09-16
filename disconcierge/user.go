@@ -110,6 +110,9 @@ func (u *User) TokenUsageSince(db *gorm.DB, since time.Time) (int64, error) {
 	return total, err
 }
 
+// ChatCommandsWithCostSince returns a ChatCommand slice with all
+// commands that were either completed, or reported token usage, since
+// the given time
 func (u *User) ChatCommandsWithCostSince(
 	db *gorm.DB,
 	at time.Time,
@@ -132,10 +135,7 @@ func (u *User) ChatCommandsWithCost6h(db *gorm.DB) ([]*ChatCommand, error) {
 	return u.ChatCommandsWithCostSince(db, time.Now().Add(-6*time.Hour))
 }
 
-func (u *User) LogValue() slog.Value {
-	if u == nil {
-		return slog.Value{}
-	}
+func (u User) LogValue() slog.Value {
 	attrs := []slog.Attr{
 		slog.String(columnUserID, u.ID),
 		slog.String("username", u.Username),

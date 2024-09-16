@@ -21,11 +21,11 @@ func DefaultTestConfig(t testing.TB) *Config {
 	cfg := DefaultConfig()
 	ids := newCommandData(t)
 
-	cfg.DatabaseType = "sqlite"
+	cfg.DatabaseType = dbTypeSQLite
 	cfg.Database = filepath.Join(tmpdir, fmt.Sprintf("%s.sqlite3", t.Name()))
 	cfg.StartupTimeout = 5 * time.Second
 	cfg.API.CORS.AllowOrigins = []string{"*"}
-	cfg.API.Development = true
+	cfg.Development = true
 	cfg.ShutdownTimeout = 10 * time.Second
 	cfg.OpenAI.Token = ids.OpenAIToken
 	cfg.Discord.Token = ids.DiscordToken
@@ -40,12 +40,15 @@ func DefaultTestConfig(t testing.TB) *Config {
 	_, err := generateSelfSignedCert(certfile, keyfile)
 	require.NoError(t, err)
 
-	cfg.API.SSL.Cert = certfile
-	cfg.API.SSL.Key = keyfile
+	cfg.API.SSL = &SSLConfig{
+		CertFile: certfile,
+		KeyFile:  keyfile,
+	}
 
 	cfg.API.Secret = "aksdfjakjsfdajfefIJHShi sfEISHSIDF HSIHDF"
-	cfg.Discord.WebhookServer.SSL.Cert = certfile
-	cfg.Discord.WebhookServer.SSL.Key = keyfile
+	cfg.Discord.WebhookServer.SSL = &SSLConfig{}
+	cfg.Discord.WebhookServer.SSL.CertFile = certfile
+	cfg.Discord.WebhookServer.SSL.KeyFile = keyfile
 
 	logLevel := slog.LevelWarn
 	cfg.LogLevel.Set(logLevel)

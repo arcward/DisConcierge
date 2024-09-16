@@ -44,7 +44,6 @@ var (
 	chatCommandPollRunStatusMaxErrors = 5
 )
 
-//goland:noinspection GoLinter
 var (
 	columnChatCommandState                 = "state"
 	columnChatCommandStep                  = "step"
@@ -58,7 +57,7 @@ var (
 	columnChatCommandFinishedAt            = "finished_at"
 	columnChatCommandUsagePromptTokens     = "usage_prompt_tokens"
 	columnChatCommandUsageCompletionTokens = "usage_completion_tokens"
-	columnChatCommandUsageTotalTokens      = "usage_total_tokens"
+	columnChatCommandUsageTotalTokens      = "usage_total_tokens" //goland:noinspection GoLinter
 	columnChatCommandAttempts              = "attempts"
 	columnChatCommandPriority              = "priority"
 	columnChatCommandAcknowledged          = "acknowledged"
@@ -67,12 +66,6 @@ var (
 	columnChatCommandContext               = "command_context"
 	columnChatCommandPrompt                = "prompt"
 	columnChatCommandID                    = "id"
-
-	columnChatCommandButtonStateGood         = "feedback_button_state_good"
-	columnChatCommandButtonStateOutdated     = "feedback_button_state_outdated"
-	columnChatCommandButtonStateHallucinated = "feedback_button_state_hallucinated"
-	columnChatCommandButtonStateOther        = "feedback_button_state_other"
-	columnChatCommandButtonStateUndo         = "feedback_button_state_reset"
 
 	columnChatCommandDiscordMessageID = "discord_message_id"
 	columnUserID                      = "user_id"
@@ -158,7 +151,7 @@ type CommandOptions struct {
 
 	// RecoverPanic determines whether the bot should recover from panics
 	// while processing user commands
-	RecoverPanic bool `json:"recover_panic" gorm:"not null;default:true"`
+	RecoverPanic bool `json:"recover_panic" gorm:"not null;default:false"`
 
 	// Error message to send to the user if an error is encountered during
 	// their command execution, which prevents the command from finishing normally
@@ -288,6 +281,8 @@ type ChatCommand struct {
 	// RunID
 	RunStatus openai.RunStatus `json:"run_status" gorm:"type:string"`
 
+	// Priority is true if [User.Priority] was true at the time
+	// the command was run
 	Priority bool `json:"priority" gorm:"type:bool"`
 
 	// Attempts is the number of times this command has had an execution
@@ -308,17 +303,9 @@ type ChatCommand struct {
 	// so we know which button was clicked and for which command
 	CustomID string `json:"custom_id" gorm:"index"`
 
-	// Discord button states
-	FeedbackButtonStateGood         FeedbackButtonState `json:"feedback_button_state_good" gorm:"type:int;check:feedback_button_state_good >= 0 AND feedback_button_state_good <= 2;default:0"`
-	FeedbackButtonStateOutdated     FeedbackButtonState `json:"feedback_button_state_outdated" gorm:"type:int;check:feedback_button_state_outdated >= 0 AND feedback_button_state_outdated <= 2;default:0"`
-	FeedbackButtonStateHallucinated FeedbackButtonState `json:"feedback_button_state_hallucinated" gorm:"type:int;check:feedback_button_state_hallucinated >= 0 AND feedback_button_state_hallucinated <= 2;default:0"`
-	FeedbackButtonStateOther        FeedbackButtonState `json:"feedback_button_state_other" gorm:"type:int;check:feedback_button_state_other >= 0 AND feedback_button_state_other <= 2;default:0"`
-	FeedbackButtonStateReset        FeedbackButtonState `json:"feedback_button_state_reset" gorm:"type:int;check:feedback_button_state_reset = 0 OR feedback_button_state_reset = 1;default:0"`
-
-	UserFeedback []UserFeedback `gorm:"->"`
+	UserFeedback []UserFeedback `gorm:"->" json:"user_feedback,omitempty"`
 
 	index   int
-	mu      *sync.RWMutex
 	handler InteractionHandler
 }
 
@@ -327,23 +314,20 @@ type ChatCommand struct {
 func NewChatCommand(u *User, i *discordgo.InteractionCreate) (
 	rec *ChatCommand, err error,
 ) {
-	if u == nil {
-		return nil, errors.New("user required")
-	}
 	interaction := NewUserInteraction(i, u)
 	rec = &ChatCommand{
 		Interaction: *interaction,
 		State:       ChatCommandStateReceived,
-		mu:          &sync.RWMutex{},
 	}
-	rec.User = u
-	rec.Priority = rec.User.Priority
-	if rec.User.ThreadID != "" {
-		rec.ThreadID = rec.User.ThreadID
-	}
+	if u != nil {
+		rec.Priority = rec.User.Priority
+		if rec.User.ThreadID != "" {
+			rec.ThreadID = rec.User.ThreadID
+		}
 
-	if u.Ignored {
-		rec.State = ChatCommandStateIgnored
+		if u.Ignored {
+			rec.State = ChatCommandStateIgnored
+		}
 	}
 
 	optionMap := discordInteractionOptions(i)
@@ -351,10 +335,25 @@ func NewChatCommand(u *User, i *discordgo.InteractionCreate) (
 		rec.Prompt = strings.TrimSpace(opt.StringValue())
 	}
 
-	randomID, err := generateRandomHexString(discordComponentCustomIDLength)
+	randomID, _ := generateRandomHexString(discordComponentCustomIDLength)
 	rec.CustomID = randomID
 
-	return rec, err
+	return rec, nil
+}
+
+func (c *ChatCommand) OpenAIRunInProgress() bool {
+	if c.RunStatus == openai.RunStatusQueued || c.RunStatus == openai.RunStatusInProgress {
+		return true
+	}
+	if strings.TrimSpace(string(c.RunStatus)) == "" && strings.TrimSpace(c.RunID) != "" {
+		return true
+	}
+
+	return false
+}
+
+func (c *ChatCommand) InteractionTokenExpired(t time.Time) bool {
+	return t.UnixMilli() >= c.TokenExpires
 }
 
 func (c *ChatCommand) Deadline() time.Time {
@@ -387,6 +386,7 @@ func (c *ChatCommand) Answer(ctx context.Context, d *DisConcierge) {
 	}
 
 	if req.ThreadID == "" {
+		ctx = WithLogger(ctx, logger)
 		_, err := getOrCreateThreadID(ctx, d, req)
 		if err != nil {
 			req.finalize(
@@ -423,19 +423,23 @@ func (c *ChatCommand) Answer(ctx context.Context, d *DisConcierge) {
 		}
 		if err != nil {
 			req.finalize(ctx, d, "", err)
+
 			return
 		}
 		if _, err = d.writeDB.Update(
+			context.TODO(),
 			req,
 			columnChatCommandMessageID,
 			msgID,
 		); err != nil {
+
 			req.finalize(
 				ctx,
 				d,
 				"",
 				fmt.Errorf("error updating message_id: %w", err),
 			)
+
 			return
 		}
 	} else {
@@ -473,24 +477,29 @@ func (c *ChatCommand) Answer(ctx context.Context, d *DisConcierge) {
 				req.MessageID,
 			),
 		)
-		run, err := d.openai.CreateRun(ctx, d.writeDB, req)
+		rctx, rcancel := context.WithTimeout(context.Background(), time.Minute)
+		defer rcancel()
+		rctx = WithLogger(rctx, logger)
+		run, err := d.openai.CreateRun(rctx, d.writeDB, req)
 
 		if err != nil {
 			req.finalize(ctx, d, "", err)
 			return
 		}
 		if _, err = d.writeDB.Updates(
-			req, map[string]any{
+			context.TODO(), req, map[string]any{
 				columnChatCommandRunID:     run.ID,
 				columnChatCommandRunStatus: run.Status,
 			},
 		); err != nil {
+
 			req.finalize(
 				ctx,
 				d,
 				"",
 				fmt.Errorf("error updating run_id: %w", err),
 			)
+
 		}
 	} else {
 		logger.InfoContext(
@@ -514,23 +523,23 @@ func (c *ChatCommand) Answer(ctx context.Context, d *DisConcierge) {
 		logger.WarnContext(ctx, "context canceled, aborting")
 		return
 	}
-
 	req.executeFromPollingRun(ctx, d)
 }
 
 // OtherButton returns a Discord button for the "Other" feedback option.
-func (c *ChatCommand) OtherButton() *discordgo.Button {
+func (c *ChatCommand) OtherButton(count int64) *discordgo.Button {
 	if c.CustomID == "" {
 		return nil
 	}
-	if c.FeedbackButtonStateOther == FeedbackButtonStateHidden {
-		return nil
-	}
 
+	label := feedbackTypeDescription[UserFeedbackOther]
+	if count > 0 {
+		label = fmt.Sprintf("%s [%d]", label, count)
+	}
 	return &discordgo.Button{
-		Label:    feedbackTypeDescription[UserFeedbackOther],
+		Label:    label,
 		Style:    discordgo.DangerButton,
-		Disabled: c.FeedbackButtonStateOther == FeedbackButtonStateDisabled,
+		Disabled: false,
 		CustomID: fmt.Sprintf(
 			customIDFormat,
 			UserFeedbackOther,
@@ -540,20 +549,20 @@ func (c *ChatCommand) OtherButton() *discordgo.Button {
 }
 
 // GoodButton returns a Discord button for the "Good" feedback option.
-func (c *ChatCommand) GoodButton() *discordgo.Button {
+func (c *ChatCommand) GoodButton(count int64) *discordgo.Button {
 	if c.CustomID == "" {
 		return nil
 	}
-	if c.FeedbackButtonStateGood == FeedbackButtonStateHidden {
-		return nil
+
+	label := feedbackTypeDescription[UserFeedbackGood]
+	if count > 0 {
+		label = fmt.Sprintf("%s [%d]", label, count)
 	}
 
 	return &discordgo.Button{
-		Style: discordgo.SuccessButton,
-		Emoji: &discordgo.ComponentEmoji{
-			Name: "👍",
-		},
-		Disabled: c.FeedbackButtonStateGood == FeedbackButtonStateDisabled,
+		Style:    discordgo.SuccessButton,
+		Label:    label,
+		Disabled: false,
 		CustomID: fmt.Sprintf(
 			customIDFormat,
 			UserFeedbackGood,
@@ -563,18 +572,20 @@ func (c *ChatCommand) GoodButton() *discordgo.Button {
 }
 
 // HallucinatedButton returns a Discord button for the "Hallucinated" feedback option.
-func (c *ChatCommand) HallucinatedButton() *discordgo.Button {
+func (c *ChatCommand) HallucinatedButton(count int64) *discordgo.Button {
 	if c.CustomID == "" {
 		return nil
 	}
-	if c.FeedbackButtonStateHallucinated == FeedbackButtonStateHidden {
-		return nil
+
+	label := feedbackTypeDescription[UserFeedbackHallucinated]
+	if count > 0 {
+		label = fmt.Sprintf("%s [%d]", label, count)
 	}
 
 	return &discordgo.Button{
-		Label:    feedbackTypeDescription[UserFeedbackHallucinated],
+		Label:    label,
 		Style:    discordgo.DangerButton,
-		Disabled: c.FeedbackButtonStateHallucinated == FeedbackButtonStateDisabled,
+		Disabled: false,
 		CustomID: fmt.Sprintf(
 			customIDFormat,
 			UserFeedbackHallucinated,
@@ -584,41 +595,22 @@ func (c *ChatCommand) HallucinatedButton() *discordgo.Button {
 }
 
 // OutdatedButton returns a Discord button for the "Outdated" feedback option.
-func (c *ChatCommand) OutdatedButton() *discordgo.Button {
+func (c *ChatCommand) OutdatedButton(count int64) *discordgo.Button {
 	if c.CustomID == "" {
 		return nil
 	}
-	if c.FeedbackButtonStateOutdated == FeedbackButtonStateHidden {
-		return nil
+	label := feedbackTypeDescription[UserFeedbackOutdated]
+	if count > 0 {
+		label = fmt.Sprintf("%s [%d]", label, count)
 	}
 
 	return &discordgo.Button{
-		Label:    feedbackTypeDescription[UserFeedbackOutdated],
+		Label:    label,
 		Style:    discordgo.DangerButton,
-		Disabled: c.FeedbackButtonStateOutdated == FeedbackButtonStateDisabled,
+		Disabled: false,
 		CustomID: fmt.Sprintf(
 			customIDFormat,
 			UserFeedbackOutdated,
-			c.CustomID,
-		),
-	}
-}
-
-// UndoButton returns a Discord button for the "Undo" action.
-func (c *ChatCommand) UndoButton() *discordgo.Button {
-	if c.CustomID == "" {
-		return nil
-	}
-	if c.FeedbackButtonStateReset == FeedbackButtonStateHidden {
-		return nil
-	}
-
-	return &discordgo.Button{
-		Style: discordgo.SecondaryButton,
-		Label: feedbackTypeDescription[UserFeedbackReset],
-		CustomID: fmt.Sprintf(
-			customIDFormat,
-			UserFeedbackReset,
 			c.CustomID,
 		),
 	}
@@ -683,187 +675,18 @@ func (c *ChatCommand) createReport(reportType FeedbackButtonType, detail string)
 	}
 }
 
-// setButtonStates updates the current state of all buttons and their
-// components, based on the given report type.
-func (c *ChatCommand) setButtonStates(reportType FeedbackButtonType) error {
-	switch reportType {
-	case UserFeedbackReset:
-		c.setFreshButtonStates()
-	case UserFeedbackGood:
-		c.FeedbackButtonStateGood = FeedbackButtonStateDisabled
-		c.FeedbackButtonStateOutdated = FeedbackButtonStateHidden
-		c.FeedbackButtonStateHallucinated = FeedbackButtonStateHidden
-		c.FeedbackButtonStateOther = FeedbackButtonStateHidden
-		c.FeedbackButtonStateReset = FeedbackButtonStateEnabled
-	case UserFeedbackOutdated:
-		c.FeedbackButtonStateOutdated = FeedbackButtonStateDisabled
-		c.FeedbackButtonStateReset = FeedbackButtonStateEnabled
-		c.FeedbackButtonStateGood = FeedbackButtonStateHidden
-	case UserFeedbackHallucinated:
-		c.FeedbackButtonStateHallucinated = FeedbackButtonStateDisabled
-
-		c.FeedbackButtonStateGood = FeedbackButtonStateHidden
-		c.FeedbackButtonStateReset = FeedbackButtonStateEnabled
-
-		if c.FeedbackButtonStateOutdated == FeedbackButtonStateHidden {
-			c.FeedbackButtonStateOutdated = FeedbackButtonStateEnabled
-		}
-
-		if c.FeedbackButtonStateOther == FeedbackButtonStateHidden {
-			c.FeedbackButtonStateOther = FeedbackButtonStateEnabled
-		}
-
-	case UserFeedbackOther:
-		c.FeedbackButtonStateOther = FeedbackButtonStateDisabled
-		c.FeedbackButtonStateGood = FeedbackButtonStateHidden
-		c.FeedbackButtonStateReset = FeedbackButtonStateEnabled
-
-		if c.FeedbackButtonStateOutdated == FeedbackButtonStateHidden {
-			c.FeedbackButtonStateOutdated = FeedbackButtonStateEnabled
-		}
-
-		if c.FeedbackButtonStateHallucinated == FeedbackButtonStateHidden {
-			c.FeedbackButtonStateHallucinated = FeedbackButtonStateEnabled
-		}
-	default:
-		return fmt.Errorf("unknown report type: %s", reportType)
-	}
-	return nil
-}
-
-// setButtons sets the current button states, components and updates the
-// current interaction based on the given UserFeedback records.
-// If no reports are provided, a 'fresh' state will be set (the default new state).
-// The overall state is set on a per-report basis, in order - so in the off
-// chance a UserFeedbackGood is provided along with a UserFeedbackOutdated, the state
-// set by UserFeedbackOutdated will be the final state.
-func (c *ChatCommand) setButtons(
-	ctx context.Context,
-	reports ...UserFeedback,
-) error {
-	logger, ok := ContextLogger(ctx)
-	if logger == nil || !ok {
-		logger = slog.Default()
-		ctx = WithLogger(ctx, logger)
-	}
-
-	if time.Now().UTC().UnixMilli() >= c.TokenExpires {
-		logger.WarnContext(ctx, "token expired, ignoring")
-		c.setExpiredButtonStates()
-		return nil
-	}
-
-	if len(reports) == 0 {
-		c.setFreshButtonStates()
-	} else {
-		for _, report := range reports {
-			if err := c.setButtonStates(FeedbackButtonType(report.Type)); err != nil {
-				return err
-			}
-		}
-	}
-
-	buttons := c.discordUserFeedbackComponents()
-
-	var errs []error
-	_, updErr := c.handler.Edit(
-		ctx,
-		&discordgo.WebhookEdit{
-			Components: &buttons,
-		},
-	)
-	if updErr != nil {
-		logger.ErrorContext(
-			ctx,
-			"error updating interaction response",
-			tint.Err(updErr),
-		)
-		errs = append(errs, updErr)
-	}
-
-	return errors.Join(errs...)
-}
-
-// newDMReport handles UserFeedback creation.
-// If this is an 'undo' action, it's subject to maxUndo as a limit (0=unlimited).
-//
-// If FeedbackButtonType is UserFeedbackGood or UserFeedbackReset, all existing
-// UserFeedback records will be soft-deleted. So UserFeedbackGood will remove an
-// existing UserFeedbackOutdated, for example.
-//
-// UserFeedbackHallucinated, UserFeedbackOutdated, and UserFeedbackOther will remove
-// any existing report that is not one of those three report types.
-//
-// This will also update the ChatCommand record, and attempt to update
-// the discord interaction to reflect new button states.
-func (c *ChatCommand) newDMReport(
-	ctx context.Context,
-	db DBI,
-	report *UserFeedback,
-) error {
-	logger, ok := ContextLogger(ctx)
-	if logger == nil || !ok {
-		logger = slog.Default()
-		ctx = WithLogger(ctx, logger)
-	}
-
-	var errs []error
-
-	if err := db.CreateReport(ctx, report); err != nil {
-		logger.ErrorContext(
-			ctx,
-			"error creating report",
-			tint.Err(err),
-			slog.Any("report", report),
-		)
-		errs = append(
-			errs,
-			fmt.Errorf("error creating/deleting report records: %w", err),
-		)
-		return errors.Join(errs...)
-	}
-	existingReports, err := c.getReports(ctx, db.DB())
-	if err != nil {
-		errs = append(errs, err)
-		return errors.Join(errs...)
-	}
-	logger.InfoContext(
-		ctx,
-		fmt.Sprintf("Found %d existing reports", len(existingReports)),
-	)
-	for _, r := range existingReports {
-		logger.DebugContext(ctx, "existing report", "report", r)
-	}
-
-	err = c.setButtons(ctx, existingReports...)
-	if err != nil {
-		errs = append(errs, err)
-	}
-	_, err = db.Updates(
-		c,
-		map[string]any{
-			columnChatCommandButtonStateGood:         c.FeedbackButtonStateGood,
-			columnChatCommandButtonStateOutdated:     c.FeedbackButtonStateOutdated,
-			columnChatCommandButtonStateHallucinated: c.FeedbackButtonStateHallucinated,
-			columnChatCommandButtonStateOther:        c.FeedbackButtonStateOther,
-			columnChatCommandButtonStateUndo:         c.FeedbackButtonStateReset,
-		},
-	)
-	errs = append(errs, err)
-	return errors.Join(errs...)
-}
-
 // discordUserFeedbackComponents returns a discordgo.MessageComponent slice, including
 // any non-nil buttons. Nil buttons indicate the button should not be included in the
 // final message components.
-func (c *ChatCommand) discordUserFeedbackComponents() []discordgo.MessageComponent {
+func (c *ChatCommand) discordUserFeedbackComponents(
+	feedbackCounts map[FeedbackButtonType]int64,
+) []discordgo.MessageComponent {
 	buttons := make([]discordgo.MessageComponent, 0, discordMaxButtonsPerActionRow)
 
-	goodButton := c.GoodButton()
-	otherButton := c.OtherButton()
-	hallucinatedButton := c.HallucinatedButton()
-	outdatedButton := c.OutdatedButton()
-	undoButton := c.UndoButton()
+	goodButton := c.GoodButton(feedbackCounts[UserFeedbackGood])
+	otherButton := c.OtherButton(feedbackCounts[UserFeedbackOther])
+	hallucinatedButton := c.HallucinatedButton(feedbackCounts[UserFeedbackHallucinated])
+	outdatedButton := c.OutdatedButton(feedbackCounts[UserFeedbackOutdated])
 
 	if goodButton != nil {
 		buttons = append(
@@ -882,10 +705,6 @@ func (c *ChatCommand) discordUserFeedbackComponents() []discordgo.MessageCompone
 		buttons = append(buttons, *otherButton)
 	}
 
-	if undoButton != nil {
-		buttons = append(buttons, *undoButton)
-	}
-
 	rows := chunkItems(discordMaxButtonsPerActionRow, buttons...)
 	messageComponent := make([]discordgo.MessageComponent, 0, len(rows))
 
@@ -898,19 +717,6 @@ func (c *ChatCommand) discordUserFeedbackComponents() []discordgo.MessageCompone
 	return messageComponent
 }
 
-// undoReportCount returns the number of 'undo' actions for this command
-// func (c *ChatCommand) undoReportCount(db *gorm.DB) (int64, error) {
-// 	var previousUndo int64
-//
-// 	ctErr := db.Model(&UserFeedback{}).Unscoped().Where(
-// 		"user_id = ? AND custom_id = ? AND type = ?",
-// 		c.UserID,
-// 		c.CustomID,
-// 		string(UserFeedbackReset),
-// 	).Count(&previousUndo).Error
-// 	return previousUndo, ctErr
-// }
-
 func (c *ChatCommand) setAbandoned(
 	ctx context.Context,
 	log *slog.Logger,
@@ -922,8 +728,10 @@ func (c *ChatCommand) setAbandoned(
 	go func() {
 		defer wg.Done()
 		if _, updErr := d.writeDB.Update(
+			context.TODO(),
 			c,
-			columnChatCommandState, ChatCommandStateAborted,
+			columnChatCommandState,
+			ChatCommandStateAborted,
 		); updErr != nil {
 			log.ErrorContext(
 				ctx,
@@ -977,8 +785,7 @@ func (c *ChatCommand) handleError(ctx context.Context, d *DisConcierge) {
 		go func() {
 			defer wg.Done()
 			if _, updErr := d.writeDB.Updates(
-				c,
-				map[string]any{
+				context.TODO(), c, map[string]any{
 					columnChatCommandAttempts: attempts,
 					columnChatCommandState:    ChatCommandStateAborted,
 				},
@@ -1012,7 +819,7 @@ func (c *ChatCommand) handleError(ctx context.Context, d *DisConcierge) {
 		return
 	}
 
-	if _, updErr := d.writeDB.Update(c, "attempts", attempts); updErr != nil {
+	if _, updErr := d.writeDB.Update(context.TODO(), c, "attempts", attempts); updErr != nil {
 		log.ErrorContext(
 			ctx,
 			"error updating attempts",
@@ -1029,10 +836,10 @@ func (c *ChatCommand) handleError(ctx context.Context, d *DisConcierge) {
 // reporting outdated information, reporting hallucinations, and reporting other issues.
 //
 // The function creates a single ActionsRow containing four buttons:
-// 1. A "thumbs up" button for positive feedback
+// 1. A "good" button for positive feedback
 // 2. A button to report outdated information
 // 3. A button to report hallucinations or inaccuracies
-// 4. A button for other types of feedback
+// 4. A button to provide user-specified feedback/detail
 //
 // Each button is assigned a custom ID based on the ChatCommand's CustomID
 // and the type of feedback it represents.
@@ -1048,9 +855,7 @@ func (c *ChatCommand) newReportButtons() []discordgo.MessageComponent {
 	buttonComponents := []discordgo.MessageComponent{
 		discordgo.Button{
 			Style: discordgo.SuccessButton,
-			Emoji: &discordgo.ComponentEmoji{
-				Name: "👍",
-			},
+			Label: feedbackTypeDescription[UserFeedbackGood],
 			CustomID: fmt.Sprintf(
 				customIDFormat,
 				UserFeedbackGood,
@@ -1133,15 +938,17 @@ func (c *ChatCommand) finalizeCompletedRun(
 			tint.Err(err),
 		)
 	} else {
-		go notifyDiscordUserReachedRateLimit(
-			ctx,
-			logger,
-			d.discord,
-			c.User,
-			usage,
-			c.Prompt,
-			c.handler.Config().DiscordNotificationChannelID,
-		)
+		go func() {
+			_ = notifyDiscordUserReachedRateLimit(
+				ctx,
+				logger,
+				d.discord,
+				c.User,
+				usage,
+				c.Prompt,
+				c.handler.Config().DiscordNotificationChannelID,
+			)
+		}()
 
 		suffixTag = fmt.Sprintf(
 			"\n%s",
@@ -1199,7 +1006,7 @@ func (c *ChatCommand) enqueue(ctx context.Context, d *DisConcierge) {
 		go func() {
 			defer wg.Done()
 			if _, err := d.writeDB.ChatCommandUpdates(
-				userRequest, map[string]any{
+				context.TODO(), userRequest, map[string]any{
 					columnChatCommandState:        userRequest.State,
 					columnChatCommandError:        userRequest.Error,
 					columnChatCommandAcknowledged: userRequest.Acknowledged,
@@ -1233,9 +1040,12 @@ func (c *ChatCommand) enqueue(ctx context.Context, d *DisConcierge) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			ectx, ecancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer ecancel()
 			_, _ = c.handler.Edit(
-				ctx,
+				ectx,
 				&discordgo.WebhookEdit{Content: &config.DiscordErrorMessage},
+				discordgo.WithContext(ectx),
 			)
 		}()
 
@@ -1243,7 +1053,7 @@ func (c *ChatCommand) enqueue(ctx context.Context, d *DisConcierge) {
 		go func() {
 			defer wg.Done()
 			if _, e := d.writeDB.ChatCommandUpdates(
-				userRequest, map[string]any{
+				context.TODO(), userRequest, map[string]any{
 					columnChatCommandState:        userRequest.State,
 					columnChatCommandError:        userRequest.Error,
 					columnChatCommandAcknowledged: userRequest.Acknowledged,
@@ -1265,6 +1075,7 @@ func (c *ChatCommand) enqueue(ctx context.Context, d *DisConcierge) {
 	if usage.CommandsAvailable {
 		logger.InfoContext(ctx, "usage details", "usage", usage)
 	} else {
+		// hit/exceeded rate limit
 		logger.WarnContext(ctx, "no commands available")
 		response := usage.UsageMessage()
 		userRequest.State = ChatCommandStateRateLimited
@@ -1273,9 +1084,12 @@ func (c *ChatCommand) enqueue(ctx context.Context, d *DisConcierge) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			ectx, ecancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer ecancel()
 			_, _ = c.handler.Edit(
-				ctx,
+				ectx,
 				&discordgo.WebhookEdit{Content: &response},
+				discordgo.WithContext(ectx),
 			)
 		}()
 
@@ -1283,11 +1097,10 @@ func (c *ChatCommand) enqueue(ctx context.Context, d *DisConcierge) {
 		go func() {
 			defer wg.Done()
 			if _, dbErr := d.writeDB.ChatCommandUpdates(
-				userRequest, map[string]any{
-					"state":        userRequest.State,
-					"error":        userRequest.Error,
-					"acknowledged": userRequest.Acknowledged,
-					"response":     userRequest.Response,
+				context.TODO(), userRequest, map[string]any{
+					columnChatCommandState:    userRequest.State,
+					columnChatCommandError:    userRequest.Error,
+					columnChatCommandResponse: userRequest.Response,
 				},
 			); dbErr != nil {
 				logger.ErrorContext(
@@ -1311,7 +1124,7 @@ func (c *ChatCommand) enqueue(ctx context.Context, d *DisConcierge) {
 			newState = ChatCommandStateExpired
 		}
 		if _, e := d.writeDB.ChatCommandUpdates(
-			userRequest, map[string]any{
+			context.TODO(), userRequest, map[string]any{
 				columnChatCommandState:        newState,
 				columnChatCommandError:        userRequest.Error,
 				columnChatCommandAcknowledged: userRequest.Acknowledged,
@@ -1350,19 +1163,11 @@ func (c *ChatCommand) executeFromPollingRun(
 		maxInterval.Duration,
 		chatCommandPollRunStatusMaxErrors,
 	)
-	if err != nil && errors.Is(err, ErrPollRunInterrupted) {
-		logger.WarnContext(ctx, "polling run interrupted")
-		return
-	}
-	if err != nil && errors.Is(err, ErrPollRunMaxErrorsExceeded) {
-		logger.ErrorContext(ctx, "max errors encountered", tint.Err(err))
-		c.finalize(ctx, d, "", err)
-		return
-	}
 
 	switch c.RunStatus {
 	case openai.RunStatusCompleted:
 		c.finalizeCompletedRun(ctx, d)
+		return
 	case openai.RunStatusIncomplete:
 		fallthrough
 	case openai.RunStatusRequiresAction:
@@ -1380,6 +1185,7 @@ func (c *ChatCommand) executeFromPollingRun(
 			"",
 			fmt.Errorf("run status: %s", c.RunStatus),
 		)
+		return
 	case openai.RunStatusQueued, openai.RunStatusInProgress:
 		logger.WarnContext(ctx, "exiting while still in progress")
 	default:
@@ -1435,16 +1241,18 @@ func (c *ChatCommand) finalizeWithError(ctx context.Context, d *DisConcierge, er
 		defer wg.Done()
 		finishedAt := time.Now()
 
-		if _, err = d.writeDB.Updates(
-			c,
-			map[string]any{
-				columnChatCommandState:      ChatCommandStateFailed,
-				columnChatCommandResponse:   &config.DiscordErrorMessage,
-				columnChatCommandError:      err.Error(),
-				columnChatCommandFinishedAt: &finishedAt,
+		if _, updateErr := d.writeDB.Updates(
+			context.TODO(), c, map[string]any{
+				columnChatCommandState:        ChatCommandStateFailed,
+				columnChatCommandResponse:     &config.DiscordErrorMessage,
+				columnChatCommandError:        err.Error(),
+				columnChatCommandFinishedAt:   &finishedAt,
+				columnChatCommandAcknowledged: c.Acknowledged,
 			},
-		); err != nil {
-			logger.ErrorContext(ctx, "error updating command state", tint.Err(err))
+		); updateErr != nil {
+			logger.ErrorContext(ctx, "error updating command state", tint.Err(updateErr))
+		} else {
+			c.discordNotifyError(ctx, logger, d, err)
 		}
 	}()
 
@@ -1458,12 +1266,6 @@ func (c *ChatCommand) finalizeWithError(ctx context.Context, d *DisConcierge, er
 			)
 		}()
 	}
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		c.discordNotifyError(ctx, logger, d, err)
-	}()
 
 	wg.Wait()
 }
@@ -1540,6 +1342,9 @@ func (c *ChatCommand) finalize(
 	wg := &sync.WaitGroup{}
 
 	if err != nil {
+		if isShutdownErr(ctx, err) || errors.Is(err, context.Canceled) {
+			return
+		}
 		c.finalizeWithError(ctx, d, err)
 		return
 	}
@@ -1550,23 +1355,16 @@ func (c *ChatCommand) finalize(
 	tokenActive := c.TokenExpires > finishedAt.UnixMilli()
 
 	if tokenActive {
-		c.setFreshButtonStates()
-
 		updates = map[string]any{
-			columnChatCommandState:                   ChatCommandStateCompleted,
-			columnChatCommandStep:                    ChatCommandStepFeedbackOpen,
-			columnChatCommandFinishedAt:              &finishedAt,
-			columnChatCommandResponse:                &answer,
-			columnChatCommandButtonStateGood:         c.FeedbackButtonStateGood,
-			columnChatCommandButtonStateOutdated:     c.FeedbackButtonStateOutdated,
-			columnChatCommandButtonStateHallucinated: c.FeedbackButtonStateHallucinated,
-			columnChatCommandButtonStateOther:        c.FeedbackButtonStateOther,
-			columnChatCommandButtonStateUndo:         c.FeedbackButtonStateReset,
+			columnChatCommandState:      ChatCommandStateCompleted,
+			columnChatCommandStep:       ChatCommandStepFeedbackOpen,
+			columnChatCommandFinishedAt: &finishedAt,
+			columnChatCommandResponse:   &answer,
 		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			c.respondToUser(ctx, d, logger, answer)
+			c.respondToUser(ctx, logger, answer)
 		}()
 	} else {
 		logger.Warn("token no longer active, will not respond to interaction")
@@ -1578,7 +1376,7 @@ func (c *ChatCommand) finalize(
 		}
 	}
 
-	if _, err = d.writeDB.Updates(c, updates); err != nil {
+	if _, err = d.writeDB.Updates(ctx, c, updates); err != nil {
 		logger.ErrorContext(
 			ctx,
 			"error updating command state",
@@ -1607,12 +1405,7 @@ func (c *ChatCommand) finalize(
 //
 // The function doesn't return any values but logs errors if they occur during
 // the response sending process.
-func (c *ChatCommand) respondToUser(
-	ctx context.Context,
-	d *DisConcierge,
-	logger *slog.Logger,
-	answer string,
-) {
+func (c *ChatCommand) respondToUser(ctx context.Context, logger *slog.Logger, answer string) {
 	config := c.handler.Config()
 
 	if config.FeedbackEnabled && c.CustomID != "" {
@@ -1626,7 +1419,6 @@ func (c *ChatCommand) respondToUser(
 			)
 			return
 		}
-		go d.chatCommandUnselectedButtonTimer(ctx, c)
 		return
 	}
 
@@ -1642,13 +1434,6 @@ func (c *ChatCommand) respondToUser(
 	}
 }
 
-// removeButtonsAt returns the time.Time any discord interaction
-// buttons should be removed or disabled
-func (c *ChatCommand) removeButtonsAt() time.Time {
-	removeAt := time.UnixMilli(c.TokenExpires).UTC().Add(-time.Minute)
-	return removeAt
-}
-
 // getReports returns all reports associated with this ChatCommand
 func (c *ChatCommand) getReports(
 	ctx context.Context,
@@ -1660,232 +1445,6 @@ func (c *ChatCommand) getReports(
 		c.ID,
 	).Order("id asc").Find(&existingReports).Error
 	return existingReports, err
-}
-
-// userReportExists checks if a user report of a specific type exists for this ChatCommand.
-//
-// This method queries the database to determine if a user report of the given type
-// exists for the specified user and ChatCommand.
-//
-// Parameters:
-//   - ctx: The context for managing the lifecycle of the database query.
-//   - db: A pointer to the gorm.DB instance for database operations.
-//   - userID: The ID of the user whose report existence is being checked.
-//   - reportType: The type of feedback report being checked.
-//
-// Returns:
-//   - int64: The number of rows found matching the query criteria.
-//   - error: An error object if the query fails, otherwise nil.
-func (c *ChatCommand) userReportExists(
-	ctx context.Context,
-	db *gorm.DB,
-	userID string,
-	reportType FeedbackButtonType,
-) (int64, error) {
-	var userFeedback UserFeedback
-	rv := db.WithContext(ctx).Where(
-		"chat_command_id = ? AND user_id = ? AND type = ?",
-		c.ID,
-		userID,
-		string(reportType),
-	).Take(&userFeedback)
-	return rv.RowsAffected, rv.Error
-}
-
-// setFreshButtonStates updates the Show* and Disable* button fields
-// to their 'new' state if ChatCommand.CustomID is set, with all buttons
-// visible and enabled (except for the undo button).
-// If ChatCommand.CustomID isn't set, everything will be hidden/disabled.
-func (c *ChatCommand) setFreshButtonStates() {
-	if c.CustomID == "" {
-		c.FeedbackButtonStateGood = FeedbackButtonStateHidden
-		c.FeedbackButtonStateOutdated = FeedbackButtonStateHidden
-		c.FeedbackButtonStateHallucinated = FeedbackButtonStateHidden
-		c.FeedbackButtonStateOther = FeedbackButtonStateHidden
-		c.FeedbackButtonStateReset = FeedbackButtonStateHidden
-		return
-	}
-
-	c.FeedbackButtonStateGood = FeedbackButtonStateEnabled
-	c.FeedbackButtonStateOutdated = FeedbackButtonStateEnabled
-	c.FeedbackButtonStateHallucinated = FeedbackButtonStateEnabled
-	c.FeedbackButtonStateOther = FeedbackButtonStateEnabled
-	c.FeedbackButtonStateReset = FeedbackButtonStateHidden
-}
-
-// setExpiredButtonStates sets button states for a command which has
-// a discord token that's about to expire. Buttons that have been selected
-// will remain visible (but disabled), while unselected buttons will be
-// removed entirely. The 'undo' button will always be removed.
-// If the 'disable[Type]' field is true and the field is visible, that means
-// it was previously selected.
-func (c *ChatCommand) setExpiredButtonStates() {
-	c.FeedbackButtonStateReset = FeedbackButtonStateHidden
-
-	// reflects the currently selected buttons
-	choices := map[FeedbackButtonType]bool{
-		UserFeedbackGood:         false,
-		UserFeedbackOutdated:     false,
-		UserFeedbackHallucinated: false,
-		UserFeedbackOther:        false,
-	}
-
-	if c.FeedbackButtonStateGood == FeedbackButtonStateDisabled {
-		choices[UserFeedbackGood] = true
-	}
-
-	if c.FeedbackButtonStateHallucinated == FeedbackButtonStateDisabled {
-		choices[UserFeedbackHallucinated] = true
-	}
-
-	if c.FeedbackButtonStateOutdated == FeedbackButtonStateDisabled {
-		choices[UserFeedbackOutdated] = true
-	}
-
-	if c.FeedbackButtonStateOther == FeedbackButtonStateDisabled {
-		choices[UserFeedbackOther] = true
-	}
-
-	// set everything as hidden and disabled, then selectively
-	// set the 'show[Type]' field for any previously selected button,
-	// so the only remaining buttons should be existing selections
-	c.FeedbackButtonStateOutdated = FeedbackButtonStateHidden
-	c.FeedbackButtonStateHallucinated = FeedbackButtonStateHidden
-	c.FeedbackButtonStateOther = FeedbackButtonStateHidden
-	c.FeedbackButtonStateGood = FeedbackButtonStateHidden
-
-	if choices[UserFeedbackGood] {
-		c.FeedbackButtonStateGood = FeedbackButtonStateDisabled
-	}
-
-	if choices[UserFeedbackHallucinated] {
-		c.FeedbackButtonStateHallucinated = FeedbackButtonStateDisabled
-	}
-
-	if choices[UserFeedbackOutdated] {
-		c.FeedbackButtonStateOutdated = FeedbackButtonStateDisabled
-	}
-
-	if choices[UserFeedbackOther] {
-		c.FeedbackButtonStateOther = FeedbackButtonStateDisabled
-	}
-}
-
-// setExpiredButtonStatesFromDB uses the database to determine which feedback
-// buttons to show/disable for this ChatCommand, and sets the fields
-// accordingly. Does not update the DB.
-func (c *ChatCommand) setExpiredButtonStatesFromDB(_ context.Context, db *gorm.DB) error {
-	type result struct {
-		Type string
-	}
-	var results []result
-
-	err := db.Table(UserFeedback{}.TableName()).Select(
-		columnUserFeedbackType,
-	).Group(columnUserFeedbackType).Where(
-		"chat_command_id = ?", c.ID,
-	).Scan(&results).Error
-
-	if err != nil {
-		return err
-	}
-
-	feedbackSeen := map[FeedbackButtonType]bool{}
-	for _, r := range results {
-		feedbackSeen[FeedbackButtonType(r.Type)] = true
-	}
-
-	c.FeedbackButtonStateReset = FeedbackButtonStateHidden
-
-	c.FeedbackButtonStateGood = FeedbackButtonStateHidden
-	c.FeedbackButtonStateOutdated = FeedbackButtonStateHidden
-	c.FeedbackButtonStateHallucinated = FeedbackButtonStateHidden
-	c.FeedbackButtonStateOther = FeedbackButtonStateHidden
-
-	if feedbackSeen[UserFeedbackGood] {
-		c.FeedbackButtonStateGood = FeedbackButtonStateDisabled
-	}
-
-	if feedbackSeen[UserFeedbackOutdated] {
-		c.FeedbackButtonStateOutdated = FeedbackButtonStateDisabled
-	}
-
-	if feedbackSeen[UserFeedbackHallucinated] {
-		c.FeedbackButtonStateHallucinated = FeedbackButtonStateDisabled
-	}
-
-	if feedbackSeen[UserFeedbackOther] {
-		c.FeedbackButtonStateOther = FeedbackButtonStateDisabled
-	}
-	return nil
-}
-
-// removeUnusedFeedbackButtons 'finalizes' an interaction whose token is about
-// to expire (preventing further updates), by removing any feedback buttons
-// that weren't selected, and leaving those that were (albeit in a disabled
-// state)
-func (c *ChatCommand) removeUnusedFeedbackButtons(
-	ctx context.Context,
-	db DBI,
-) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	logger, ok := ContextLogger(ctx)
-	if logger == nil || !ok {
-		logger = slog.Default()
-		ctx = WithLogger(ctx, logger)
-	}
-	logger.InfoContext(ctx, "removing unused feedback buttons!")
-
-	err := db.DB().Last(c).Error
-	if err != nil {
-		logger.ErrorContext(ctx, "unable to refresh command", tint.Err(err))
-	}
-
-	if c.hasPrivateFeedback() {
-		c.setExpiredButtonStates()
-	} else {
-		err = c.setExpiredButtonStatesFromDB(ctx, db.DB())
-		if err != nil {
-			logger.ErrorContext(
-				ctx,
-				"unable to set expired button states",
-				tint.Err(err),
-			)
-		}
-	}
-	buttons := c.discordUserFeedbackComponents()
-	_, updErr := c.handler.Edit(
-		ctx,
-		&discordgo.WebhookEdit{
-			Components: &buttons,
-		},
-	)
-	if updErr != nil {
-		logger.ErrorContext(
-			ctx,
-			"error updating interaction response",
-			tint.Err(updErr),
-		)
-		return updErr
-	}
-
-	if c.Step != ChatCommandStepFeedbackOpen {
-		logger.WarnContext(ctx, "command not in feedback open state")
-	}
-	_, saveErr := db.Updates(
-		c,
-		map[string]any{
-			columnChatCommandButtonStateGood:         c.FeedbackButtonStateGood,
-			columnChatCommandButtonStateOutdated:     c.FeedbackButtonStateOutdated,
-			columnChatCommandButtonStateHallucinated: c.FeedbackButtonStateHallucinated,
-			columnChatCommandButtonStateOther:        c.FeedbackButtonStateOther,
-			columnChatCommandButtonStateUndo:         c.FeedbackButtonStateReset,
-			columnChatCommandStep:                    ChatCommandStepFeedbackClosed,
-		},
-	)
-	return saveErr
 }
 
 func (c ChatCommand) LogValue() slog.Value {
@@ -1942,6 +1501,10 @@ func (c ChatCommand) LogValue() slog.Value {
 		)
 	}
 
+	if c.handler != nil {
+		attrs = append(attrs, slog.Any("options", structToSlogValue(c.handler.Config())))
+	}
+
 	return slog.GroupValue(
 		attrs...,
 	)
@@ -1950,82 +1513,6 @@ func (c ChatCommand) LogValue() slog.Value {
 // Age returns the time elapsed since the command was created
 func (c *ChatCommand) Age() time.Duration {
 	return time.Since(time.UnixMilli(c.CreatedAt))
-}
-
-// finalizeExpiredButtons updates the button states of an ChatCommand when its
-// interaction token is about to expire.
-// It sets the button states according to the command's
-// context (private or DM), or based on the database state for public interactions.
-//
-// After updating the button states, it updates the ChatCommand record in the database.
-//
-// Parameters:
-//   - ctx: The context for the operation, which may include logging information.
-//   - dc: A pointer to the DisConcierge instance, which provides access to
-//     the database and other services.
-//   - c: A pointer to the ChatCommand whose buttons need to be finalized.
-//
-// The function performs the following steps:
-//  1. If the command is a private or DM, it calls setExpiredButtonStates()
-//     directly on the ChatCommand.
-//  2. For public interactions, it calls setExpiredButtonStatesFromDB() to
-//     update button states based on existing feedback.
-//  3. It sets the ChatCommand's Step to ChatCommandStepFeedbackClosed.
-//  4. It updates the ChatCommand record in the database with the new button states and step.
-//
-// If any errors occur during the database update, they are logged but not returned.
-//
-// This function is typically called when an interaction's token is about to
-// expire, ensuring that the UI reflects the final state of user feedback options,
-// and so users can see that the buttons are no longer functional.
-func (c *ChatCommand) finalizeExpiredButtons(ctx context.Context, db DBI) {
-	// TODO add a config for the expiration timer for testing
-	logger, ok := ContextLogger(ctx)
-	if logger == nil || !ok {
-		logger = slog.Default()
-		ctx = WithLogger(ctx, logger)
-	}
-
-	if c.hasPrivateFeedback() {
-		c.setExpiredButtonStates()
-	} else {
-		if err := c.setExpiredButtonStatesFromDB(ctx, db.DB()); err != nil {
-			logger.ErrorContext(
-				ctx, "error setting expired buttons", tint.Err(err),
-			)
-			return
-		}
-	}
-
-	c.Step = ChatCommandStepFeedbackClosed
-	_, saveErr := db.Updates(
-		c,
-		map[string]any{
-			columnChatCommandButtonStateGood:         c.FeedbackButtonStateGood,
-			columnChatCommandButtonStateOutdated:     c.FeedbackButtonStateOutdated,
-			columnChatCommandButtonStateHallucinated: c.FeedbackButtonStateHallucinated,
-			columnChatCommandButtonStateOther:        c.FeedbackButtonStateOther,
-			columnChatCommandButtonStateUndo:         c.FeedbackButtonStateReset,
-			columnChatCommandStep:                    c.Step,
-		},
-	)
-
-	if saveErr != nil {
-		logger.ErrorContext(
-			ctx,
-			"error setting feedback closed",
-			tint.Err(saveErr),
-		)
-	}
-}
-
-// hasPrivateFeedback returns true if this command was the result
-// of a `/private` slash command, or if the command was sent via DM
-func (c *ChatCommand) hasPrivateFeedback() bool {
-	return c.Private ||
-		c.CommandContext == discordgo.InteractionContextType(
-			discordgo.InteractionContextBotDM,
-		).String()
 }
 
 // getOrCreateThreadID returns [ChatCommand.ThreadID], if set. Otherwise,
@@ -2049,6 +1536,7 @@ func getOrCreateThreadID(
 		if threadID != "" {
 			c.ThreadID = threadID
 			if _, err := d.writeDB.Update(
+				context.TODO(),
 				c,
 				columnChatCommandThreadID,
 				threadID,
@@ -2096,6 +1584,7 @@ func getOrCreateThreadID(
 
 	user.ThreadID = threadID
 	if _, err = d.writeDB.Update(
+		context.TODO(),
 		user,
 		columnChatCommandThreadID,
 		threadID,
@@ -2105,6 +1594,7 @@ func getOrCreateThreadID(
 
 	c.ThreadID = threadID
 	if _, err = d.writeDB.Update(
+		context.TODO(),
 		c,
 		columnChatCommandThreadID,
 		threadID,
@@ -2160,6 +1650,7 @@ func discordNotifyCommandPanicked(
 			req.InteractionID,
 			req.Prompt,
 		),
+		discordgo.WithContext(ctx),
 		discordgo.WithRestRetries(1),
 		discordgo.WithRetryOnRatelimit(true),
 	); sendErr != nil {

@@ -4,6 +4,7 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"github.com/bwmarrin/discordgo"
 	"github.com/lmittmann/tint"
 	"log/slog"
@@ -24,6 +25,30 @@ type InteractionLog struct {
 	Context       string                          `json:"context" gorm:"type:string"`
 	Payload       string                          `json:"payload" gorm:"type:string"`
 	CreatedAt     int64                           `gorm:"autoCreateTime:milli" json:"created_at,omitempty"`
+}
+
+func newInteractionLog(
+	i *discordgo.InteractionCreate,
+	u *discordgo.User,
+	handler InteractionHandler,
+) (*InteractionLog, error) {
+	p, err := json.Marshal(i)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling interaction: %w", err)
+	}
+
+	interactionLog := &InteractionLog{
+		InteractionID: i.ID,
+		Type:          i.Type.String(),
+		UserID:        u.ID,
+		Username:      u.String(),
+		GuildID:       i.GuildID,
+		ChannelID:     i.ChannelID,
+		Context:       i.Context.String(),
+		Payload:       string(p),
+		Method:        handler.InteractionReceiveMethod(),
+	}
+	return interactionLog, nil
 }
 
 // Interaction is a 'base' struct of fields for Discord interactions, shared

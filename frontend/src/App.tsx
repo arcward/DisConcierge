@@ -1,8 +1,8 @@
 import React                        from 'react';
 import ProtectedRoute               from './components/ProtectedRoute';
-import Login           from './components/Login';
-import AppMenu         from './components/AppMenu';
-import {Route, Routes} from "react-router-dom";
+import Login                        from './components/Login';
+import AppMenu                      from './components/AppMenu';
+import {Route, Routes}              from "react-router-dom";
 import axios                        from 'axios';
 import {createTheme, ThemeProvider} from '@mui/material/styles';
 import Main                         from './components/Main';
@@ -16,12 +16,13 @@ import '@fontsource/roboto/500.css';
 import '@fontsource/roboto/700.css';
 import Toolbar                      from "@mui/material/Toolbar";
 import {AuthProvider, useAuth}      from './authContext';
-import FirstTimeSetup               from './components/InitialSetup';
 import ChatCommandsList             from './components/ChatCommandList';
 import DiscordMessageList           from './components/DiscordMessageList';
 import NotFound                     from './components/NotFound';
 import SnackbarProvider             from './alertLoadingContext';
 import UserFeedbackList             from './components/UserFeedbackList';
+import ChatCommandView              from './components/ChatCommandView';
+import UserFeedbackView             from './components/UserFeedbackView';
 
 axios.defaults.withCredentials = true;
 
@@ -35,36 +36,33 @@ const darkTheme = createTheme({
 
 
 const AppRoutes = () => {
-    const {setupRequired, setSetupRequired, isLoading} = useAuth();
+    const {isLoading} = useAuth();
 
-    if (setupRequired === null || isLoading) {
+    if (isLoading) {
         return <div>Loading...</div>;
     }
 
     return (
         <Routes>
-            {setupRequired && (
-                <Route path="/setup"
-                       element={<FirstTimeSetup onSetupComplete={() => setSetupRequired(false)}/>}/>
-            )}
-            {!setupRequired && (
-                <>
 
-                    <Route path="/login" element={<Login/>}/>
+            <Route path="/login" element={<Login/>}/>
 
-                    <Route path="/" element={<ProtectedRoute><Main/></ProtectedRoute>}/>
-                    <Route path="/users" element={<ProtectedRoute><Users/></ProtectedRoute>}/>
-                    <Route path="/config"
-                           element={<ProtectedRoute><RuntimeConfigView/></ProtectedRoute>}/>
-                    <Route path="/chat_commands"
-                           element={<ProtectedRoute><ChatCommandsList/></ProtectedRoute>}/>
-                    <Route path="/discord_messages"
-                           element={<ProtectedRoute><DiscordMessageList/></ProtectedRoute>}/>
-                    <Route path="/user_feedback"
-                           element={<ProtectedRoute><UserFeedbackList/></ProtectedRoute>}/>
-                    <Route path="*" element={<NotFound/>}/>
-                </>
-            )}
+            <Route path="/" element={<ProtectedRoute><Main/></ProtectedRoute>}/>
+            <Route path="/users" element={<ProtectedRoute><Users/></ProtectedRoute>}/>
+            <Route path="/config"
+                   element={<ProtectedRoute><RuntimeConfigView/></ProtectedRoute>}/>
+            <Route path="/chat_commands"
+                   element={<ProtectedRoute><ChatCommandsList/></ProtectedRoute>}/>
+            <Route path="/discord_messages"
+                   element={<ProtectedRoute><DiscordMessageList/></ProtectedRoute>}/>
+            <Route path="/user_feedback"
+                   element={<ProtectedRoute><UserFeedbackList/></ProtectedRoute>}/>
+            <Route path="/chat_command/:id"
+                   element={<ProtectedRoute><ChatCommandView/></ProtectedRoute>}/>
+            <Route path="/user_feedback/:id"
+                   element={<ProtectedRoute><UserFeedbackView/></ProtectedRoute>}/>
+            <Route path="*" element={<NotFound/>}/>
+
 
         </Routes>
     );

@@ -42,6 +42,8 @@ var (
 		"pragma foreign_keys = ON;",
 		"pragma mmap_size = 8000000000;",
 	}
+	dbOperationTimeout    = 30 * time.Second
+	dbNotifierSendTimeout = 15 * time.Second
 )
 
 // ModelUnixTime is an embeddable model with Unix timestamps for
@@ -241,7 +243,7 @@ func (d *database) GetOrCreateUser(
 			updates[columnUserUsername] = u.Username
 			updates[columnUserGlobalName] = u.GlobalName
 		}
-		if _, err := d.Updates(user, updates); err != nil {
+		if _, err := d.Updates(context.TODO(), user, updates); err != nil {
 			log.Error("error updating user", "user", user, tint.Err(err))
 		}
 		return user, false, nil
@@ -257,7 +259,7 @@ func (d *database) GetOrCreateUser(
 
 	log.InfoContext(ctx, "creating new user", "user", user)
 
-	_, err := d.Create(user)
+	_, err := d.Create(ctx, user)
 	if err != nil {
 		log.Error("error creating user", "user", user, tint.Err(err))
 		return nil, true, err
@@ -267,7 +269,7 @@ func (d *database) GetOrCreateUser(
 	return user, true, nil
 }
 
-func (d *database) Create(value any, omit ...string) (
+func (d *database) Create(ctx context.Context, value any, omit ...string) (
 	rowsAffected int64,
 	err error,
 ) {
@@ -275,47 +277,51 @@ func (d *database) Create(value any, omit ...string) (
 		d.mu.Lock()
 		defer d.mu.Unlock()
 	}
+	db := d.db
+	_, ok := ctx.Deadline()
+	if !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, dbOperationTimeout)
+		defer cancel()
+	}
+	db = db.WithContext(ctx)
 
 	if len(omit) > 0 {
-		rv := d.db.Omit(omit...).Create(value)
+		rv := db.Omit(omit...).Create(value)
 		return rv.RowsAffected, rv.Error
 	}
-	rv := d.db.Create(value)
+	rv := db.Create(value)
 	return rv.RowsAffected, rv.Error
 }
 
-func (d *database) Updates(model, values any) (rowsAffected int64, err error) {
+func (d *database) Updates(ctx context.Context, model, values any) (
+	rowsAffected int64,
+	err error,
+) {
 	if !d.enableConcurrentWrites {
 		d.mu.Lock()
 		defer d.mu.Unlock()
 	}
-	rv := d.db.Model(model).Updates(values)
+	_, ok := ctx.Deadline()
+	if !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, dbOperationTimeout)
+		defer cancel()
+	}
+	rv := d.db.WithContext(ctx).Model(model).Updates(values)
 	return rv.RowsAffected, rv.Error
 }
 
 func (d *database) ChatCommandUpdates(
+	ctx context.Context,
 	model *ChatCommand,
 	values any,
 ) (rowsAffected int64, err error) {
-	return d.Updates(model, values)
-}
-
-func (d *database) ChatCommandSave(
-	model *ChatCommand,
-	omit ...string,
-) (rowsAffected int64, err error) {
-	return d.Save(model, omit...)
-}
-
-func (d *database) ChatCommandUpdate(
-	model *ChatCommand,
-	column string,
-	value any,
-) (rowsAffected int64, err error) {
-	return d.Update(model, column, value)
+	return d.Updates(ctx, model, values)
 }
 
 func (d *database) Transaction(
+	ctx context.Context,
 	fc func(tx *gorm.DB) error,
 	opts ...*sql.TxOptions,
 ) (err error) {
@@ -323,88 +329,17 @@ func (d *database) Transaction(
 		d.mu.Lock()
 		defer d.mu.Unlock()
 	}
-	rv := d.db.Transaction(fc, opts...)
+	_, ok := ctx.Deadline()
+	if !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, dbOperationTimeout)
+		defer cancel()
+	}
+	rv := d.db.WithContext(ctx).Transaction(fc, opts...)
 	return rv
 }
 
-// CreateReport (using a single transaction) creates the given report, then
-// deletes all other UserFeedback records that aren't in a matching
-// 'category' (so creating a new good/undo report
-// should soft-delete 'bad' reports, and creating a 'bad' report should
-// delete good/undo, but not other 'bad' reports)
-func (d *database) CreateReport(
-	ctx context.Context,
-	report *UserFeedback,
-) error {
-	log, ok := ContextLogger(ctx)
-	if log == nil || !ok {
-		log = d.logger
-		if log == nil {
-			log = slog.Default()
-		}
-	}
-	log.InfoContext(ctx, "inserting report", "report", report)
-	if !d.enableConcurrentWrites {
-		d.mu.Lock()
-		defer d.mu.Unlock()
-	}
-	tx := d.db.Begin()
-	defer func() {
-		if r := recover(); r != nil {
-			tx.Rollback()
-		}
-	}()
-	if err := tx.Error; err != nil {
-		return err
-	}
-	if err := tx.Create(report).Error; err != nil {
-		tx.Rollback()
-		return err
-	}
-	log.InfoContext(
-		ctx,
-		fmt.Sprintf("Created report with ID %d", report.ID),
-		"report",
-		report,
-	)
-
-	switch FeedbackButtonType(report.Type) {
-	case UserFeedbackGood, UserFeedbackReset:
-		log.InfoContext(ctx, "deleting previous reports", "report", report)
-		if delerr := tx.Delete(
-			&UserFeedback{},
-			"chat_command_id = ? AND id != ?",
-			report.ChatCommandID,
-			report.ID,
-		).Error; delerr != nil {
-			tx.Rollback()
-			return delerr
-		}
-	case UserFeedbackHallucinated, UserFeedbackOutdated, UserFeedbackOther:
-		log.InfoContext(
-			ctx,
-			"deleting previous good/undo reports",
-			"report",
-			report,
-		)
-		if delerr := tx.Delete(
-			&UserFeedback{},
-			"chat_command_id = ? AND type NOT IN ?",
-			report.ChatCommandID,
-			[]string{
-				string(UserFeedbackHallucinated),
-				string(UserFeedbackOutdated),
-				string(UserFeedbackOther),
-			},
-		).Error; delerr != nil {
-			tx.Rollback()
-			return delerr
-		}
-	}
-	return tx.Commit().Error
-}
-
-func (d *database) Save(value any, omit ...string) (
+func (d *database) Save(ctx context.Context, value any, omit ...string) (
 	rowsAffected int64,
 	err error,
 ) {
@@ -412,15 +347,23 @@ func (d *database) Save(value any, omit ...string) (
 		d.mu.Lock()
 		defer d.mu.Unlock()
 	}
+	_, ok := ctx.Deadline()
+	if !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, dbOperationTimeout)
+		defer cancel()
+	}
+
 	if len(omit) > 0 {
-		rv := d.db.Omit(omit...).Save(value)
+		rv := d.db.WithContext(ctx).Omit(omit...).Save(value)
 		return rv.RowsAffected, rv.Error
 	}
-	rv := d.db.Save(value)
+	rv := d.db.WithContext(ctx).Save(value)
 	return rv.RowsAffected, rv.Error
 }
 
 func (d *database) Update(
+	ctx context.Context,
 	model any,
 	column string,
 	value any,
@@ -429,11 +372,19 @@ func (d *database) Update(
 		d.mu.Lock()
 		defer d.mu.Unlock()
 	}
-	rv := d.db.Model(model).Update(column, value)
+	_, ok := ctx.Deadline()
+	if !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, dbOperationTimeout)
+		defer cancel()
+	}
+
+	rv := d.db.WithContext(ctx).Model(model).Update(column, value)
 	return rv.RowsAffected, rv.Error
 }
 
 func (d *database) UpdatesWhere(
+	ctx context.Context,
 	model any,
 	values map[string]any,
 	query any,
@@ -443,7 +394,14 @@ func (d *database) UpdatesWhere(
 		d.mu.Lock()
 		defer d.mu.Unlock()
 	}
-	rv := d.db.Model(model).Where(query, conds...).Updates(values)
+	_, ok := ctx.Deadline()
+	if !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, dbOperationTimeout)
+		defer cancel()
+	}
+
+	rv := d.db.WithContext(ctx).Model(model).Where(query, conds...).Updates(values)
 	return rv.RowsAffected, rv.Error
 }
 
@@ -502,7 +460,7 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 	return d.parse(s)
 }
 
-// MarshalJSON implements the json.Marshaler interface.
+// MarshalJSON implements the json.Marshaller interface.
 func (d Duration) MarshalJSON() ([]byte, error) {
 	return []byte(fmt.Sprintf(`%q`, d.String())), nil
 }
@@ -533,17 +491,25 @@ type DBI interface {
 	GetUser(userID string) *User
 	ReloadUser(userID string) *User
 	GetOrCreateUser(ctx context.Context, dc *DisConcierge, u discordgo.User) (*User, bool, error)
-	Create(value any, omit ...string) (rowsAffected int64, err error)
-	Updates(model any, values any) (rowsAffected int64, err error)
+	Create(ctx context.Context, value any, omit ...string) (rowsAffected int64, err error)
+	Updates(ctx context.Context, model any, values any) (rowsAffected int64, err error)
 	Delete(value any, conds ...any) (rowsAffected int64, err error)
-	ChatCommandUpdates(model *ChatCommand, values any) (rowsAffected int64, err error)
-	ChatCommandSave(model *ChatCommand, omit ...string) (rowsAffected int64, err error)
-	ChatCommandUpdate(model *ChatCommand, column string, value any) (rowsAffected int64, err error)
-	Transaction(fc func(tx *gorm.DB) error, opts ...*sql.TxOptions) (err error)
-	CreateReport(ctx context.Context, report *UserFeedback) error
-	Save(value any, omit ...string) (rowsAffected int64, err error)
-	Update(model any, column string, value any) (rowsAffected int64, err error)
+	ChatCommandUpdates(ctx context.Context, model *ChatCommand, values any) (
+		rowsAffected int64,
+		err error,
+	)
+	Transaction(
+		ctx context.Context,
+		fc func(tx *gorm.DB) error,
+		opts ...*sql.TxOptions,
+	) (err error)
+	Save(ctx context.Context, value any, omit ...string) (rowsAffected int64, err error)
+	Update(ctx context.Context, model any, column string, value any) (
+		rowsAffected int64,
+		err error,
+	)
 	UpdatesWhere(
+		ctx context.Context,
 		model any,
 		values map[string]any,
 		query any,
@@ -566,7 +532,7 @@ func CreateDB(ctx context.Context, databaseType string, database string) (*gorm.
 	handler := tint.NewHandler(
 		os.Stdout,
 		&tint.Options{
-			Level:     slog.LevelInfo,
+			Level:     slog.LevelWarn,
 			AddSource: true,
 		},
 	)
@@ -577,10 +543,8 @@ func CreateDB(ctx context.Context, databaseType string, database string) (*gorm.
 	dbLogger.InfoContext(
 		ctx,
 		"Initializing database",
-		"database_type",
-		databaseType,
-		"database",
-		database,
+		"database_type", databaseType,
+		"database", database,
 	)
 	db, err := getDB(databaseType, database, gormLogger)
 	if err != nil {
@@ -597,7 +561,6 @@ func CreateDB(ctx context.Context, databaseType string, database string) (*gorm.
 		&OpenAIRetrieveRun{},
 		&OpenAIListMessages{},
 		&OpenAIListRunSteps{},
-
 		&User{},
 		&ChatCommand{},
 		&ClearCommand{},
@@ -669,6 +632,7 @@ func getDB(
 
 // DBNotifier defines the interface for notifying bot instances of database
 // changes and other events.
+// TODO there's a cleaner way to implement this notifier stuff
 type DBNotifier interface {
 	UserCacheChannelName() string
 
@@ -699,18 +663,44 @@ type DBNotifier interface {
 	Listen(ctx context.Context, channel string) error
 }
 
+func newDBNotifier(d *DisConcierge) (DBNotifier, error) {
+	notifyID, err := generateRandomHexString(16)
+	if err != nil {
+		return nil, err
+	}
+	log := d.logger.With(loggerNameKey, "db_notifier")
+	var notifier DBNotifier
+	switch d.config.DatabaseType {
+	case dbTypeSQLite:
+		notifier = &sqliteNotifier{
+			logger:         log,
+			d:              d,
+			sqliteNotifyID: notifyID,
+		}
+	case dbTypePostgres:
+		notifier = &postgresNotifier{
+			d:          d,
+			logger:     log,
+			pgNotifyID: notifyID,
+		}
+	default:
+		return nil, errors.New("invalid database type")
+	}
+	return notifier, nil
+}
+
 type sqliteNotifier struct {
 	logger         *slog.Logger
 	d              *DisConcierge
 	sqliteNotifyID string
 }
 
-func (s *sqliteNotifier) Listen(ctx context.Context, channel string) error {
+func (s *sqliteNotifier) Listen(_ context.Context, channel string) error {
 	s.logger.Debug("listener called", "channel", channel)
 	return nil
 }
 
-func (s *sqliteNotifier) StopChannelName() string {
+func (sqliteNotifier) StopChannelName() string {
 	return ""
 }
 
@@ -726,7 +716,7 @@ func (s *sqliteNotifier) Stop(ctx context.Context) bool {
 	return true
 }
 
-func (s *sqliteNotifier) UserUpdateChannelName() string {
+func (sqliteNotifier) UserUpdateChannelName() string {
 	return ""
 }
 
@@ -769,11 +759,11 @@ func (s *sqliteNotifier) ReloadUserCache(ctx context.Context) bool {
 	return true
 }
 
-func (s *sqliteNotifier) UserCacheChannelName() string {
+func (sqliteNotifier) UserCacheChannelName() string {
 	return ""
 }
 
-func (s *sqliteNotifier) RuntimeConfigChannelName() string {
+func (sqliteNotifier) RuntimeConfigChannelName() string {
 	return ""
 }
 
@@ -783,11 +773,11 @@ type postgresNotifier struct {
 	pgNotifyID string
 }
 
-func (p *postgresNotifier) UserCacheChannelName() string {
+func (postgresNotifier) UserCacheChannelName() string {
 	return postgresNotifyChannelReloadUserCache
 }
 
-func (p *postgresNotifier) RuntimeConfigChannelName() string {
+func (postgresNotifier) RuntimeConfigChannelName() string {
 	return postgresNotifyChannelRuntimeConfigUpdated
 }
 
@@ -799,11 +789,11 @@ func (p *postgresNotifier) DB() DBI {
 	return p.d.writeDB
 }
 
-func (p *postgresNotifier) UserUpdateChannelName() string {
+func (postgresNotifier) UserUpdateChannelName() string {
 	return postgresNotifyChannelUserUpdated
 }
 
-func (p *postgresNotifier) StopChannelName() string {
+func (postgresNotifier) StopChannelName() string {
 	return postgresNotifyChannelStop
 }
 
@@ -835,7 +825,10 @@ func (p *postgresNotifier) Listen(ctx context.Context, channel string) error {
 	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, config)
-
+	if err != nil {
+		p.logger.ErrorContext(ctx, "Error creating connection pool", tint.Err(err))
+		return err
+	}
 	defer pool.Close()
 
 	// Start listening for notifications
@@ -876,7 +869,7 @@ func (p *postgresNotifier) Listen(ctx context.Context, channel string) error {
 			select {
 			case p.d.triggerUserCacheRefreshCh <- true:
 				logger.Info("sent cache refresh signal from postgres listener")
-			case <-time.After(15 * time.Second):
+			case <-time.After(dbNotifierSendTimeout):
 				logger.Warn("timed out sending config refresh signal")
 			}
 		case p.RuntimeConfigChannelName():
@@ -884,7 +877,7 @@ func (p *postgresNotifier) Listen(ctx context.Context, channel string) error {
 			select {
 			case p.d.triggerRuntimeConfigRefreshCh <- true:
 				logger.Info("sent runtime config refresh signal from postgres listener")
-			case <-time.After(15 * time.Second):
+			case <-time.After(dbNotifierSendTimeout):
 				logger.Warn("timed out sending config refresh signal")
 			}
 		case p.UserUpdateChannelName():
@@ -896,7 +889,7 @@ func (p *postgresNotifier) Listen(ctx context.Context, channel string) error {
 			select {
 			case p.d.triggerUserUpdatedRefreshCh <- userID:
 				logger.Info("sent signal to update user", "user_id", userID)
-			case <-time.After(15 * time.Second):
+			case <-time.After(dbNotifierSendTimeout):
 				logger.Warn("timed out sending user refresh signal", "user_id", userID)
 			}
 		case p.StopChannelName():
@@ -904,7 +897,7 @@ func (p *postgresNotifier) Listen(ctx context.Context, channel string) error {
 			select {
 			case p.d.signalStop <- struct{}{}:
 				logger.Info("forwarded stop signal")
-			case <-time.After(15 * time.Second):
+			case <-time.After(dbNotifierSendTimeout):
 				logger.Warn("timed out forwarding stop signal")
 			}
 		default:
@@ -915,7 +908,7 @@ func (p *postgresNotifier) Listen(ctx context.Context, channel string) error {
 	return nil
 }
 
-func parseUserUpdatedNotification(s string) (notifierID string, userID string) {
+func parseUserUpdatedNotification(s string) (notifierID, userID string) {
 	before, after, _ := strings.Cut(s, recordSeparator)
 	return before, after
 }
@@ -1004,19 +997,9 @@ func (p *postgresNotifier) ReloadUserCache(ctx context.Context) bool {
 	select {
 	case p.d.triggerUserCacheRefreshCh <- true:
 	//
-	case <-time.After(30 * time.Second):
+	case <-ctx.Done():
 		p.logger.Warn("timeout sending user cache refresh signal")
 	}
 
 	return sent
-}
-
-type UserCache interface {
-	Users() map[string]*User
-	Lock()
-	Unlock()
-	Load() ([]User, error)
-	GetUser(userID string) *User
-	ReloadUser(userID string) *User
-	GetOrCreateUser(context.Context)
 }

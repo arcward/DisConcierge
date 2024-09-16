@@ -12,6 +12,7 @@ import (
 	"gorm.io/gorm"
 	"log/slog"
 	mathrand "math/rand"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -23,88 +24,6 @@ import (
 var (
 	randomGenerator = mathrand.New(mathrand.NewSource(1))
 )
-
-// gormDB creates a temporary SQLite database for testing purposes.
-//
-// The function creates a temporary directory, constructs a SQLite database file path within it,
-// and initializes the database using the CreateDB function. If there is an error during database
-// creation, the test fails with a fatal error.
-func gormDB(t testing.TB) *gorm.DB {
-	t.Helper()
-	tmpdir := t.TempDir()
-	dbfile := filepath.Join(tmpdir, fmt.Sprintf("%s.sqlite3", t.Name()))
-
-	db, err := CreateDB(context.Background(), "sqlite", dbfile)
-	if err != nil {
-		t.Fatalf("error creating db: %v", err)
-	}
-	return db
-}
-
-// setLoggers configures the loggers for the DisConcierge bot and its components.
-//
-// The function sets up loggers with test-specific attributes and reverts
-// the loggers to their original state when the test finishes.
-func setLoggers(t testing.TB, bot *DisConcierge) {
-	t.Helper()
-
-	originalDefault := slog.Default()
-	slog.SetDefault(originalDefault.With("test", t.Name()))
-	t.Cleanup(
-		func() {
-			slog.SetDefault(originalDefault)
-		},
-	)
-
-	baseLogger := bot.logger
-	bot.logger = baseLogger.With("test", t.Name())
-	bot.openai.logger = bot.openai.logger.With("test", t.Name())
-	bot.discord.logger = bot.discord.logger.With("test", t.Name())
-	bot.api.logger = bot.api.logger.With("test", t.Name())
-	dbLogHandler := tint.NewHandler(
-		os.Stdout, &tint.Options{
-			Level:     bot.config.DatabaseLogLevel,
-			AddSource: true,
-		},
-	).WithAttrs([]slog.Attr{slog.String("test", t.Name())})
-	if bot.db != nil {
-		bot.db.Logger = newGORMLogger(
-			dbLogHandler,
-			bot.config.DatabaseSlowThreshold,
-		)
-	}
-
-	discordgo.Logger = discordgoLoggerFunc(context.Background(), dbLogHandler)
-	bot.requestQueue.logger = bot.requestQueue.logger.With("test", t.Name())
-}
-
-// DefaultTestRuntimeConfig returns a default RuntimeConfig for testing purposes.
-// It primarily sets more verbose log levels and shorter poll intervals.
-func DefaultTestRuntimeConfig(t testing.TB) *RuntimeConfig {
-	t.Helper()
-	cfg := DefaultRuntimeConfig()
-	pi := 250 * time.Millisecond
-	cfg.AssistantPollInterval = Duration{pi}
-	cfg.AssistantMaxPollInterval = Duration{pi}
-
-	logLevel := DBLogLevelDebug
-	if isCI(t) {
-		logLevel = DBLogLevelWarn
-	}
-	cfg.LogLevel = logLevel
-	cfg.DiscordLogLevel = logLevel
-	cfg.DatabaseLogLevel = logLevel
-	cfg.DiscordGoLogLevel = logLevel
-	cfg.APILogLevel = logLevel
-	cfg.OpenAILogLevel = logLevel
-	cfg.RecoverPanic = false
-	cfg.AdminUsername = fmt.Sprintf("user_%s", t.Name())
-	password := fmt.Sprintf("password_%s", t.Name())
-	hashedPassword, err := hashPassword(password)
-	require.NoError(t, err)
-	cfg.AdminPassword = hashedPassword
-	return &cfg
-}
 
 func TestCustomID(t *testing.T) {
 	reportType := UserFeedbackHallucinated
@@ -185,7 +104,7 @@ func TestShortenString(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(
 			tc.name, func(t *testing.T) {
-				result := shortenString(tc.input, tc.limit)
+				result := minifyString(tc.input, tc.limit)
 				assert.Equal(t, tc.expected, result)
 				assert.LessOrEqual(t, len(result), tc.limit)
 			},
@@ -258,7 +177,7 @@ func TestHashPasswordAndVerify(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(
 			tc.name, func(t *testing.T) {
-				hash, err := hashPassword(tc.password)
+				hash, err := HashPassword(tc.password)
 				if err != nil {
 					t.Fatalf("HashPassword failed: %v", err)
 				}
@@ -268,7 +187,7 @@ func TestHashPasswordAndVerify(t *testing.T) {
 				}
 
 				// Test VerifyPassword with correct password
-				valid, err := verifyPassword(hash, tc.password)
+				valid, err := VerifyPassword(hash, tc.password)
 				if err != nil {
 					t.Fatalf("VerifyPassword failed: %v", err)
 				}
@@ -277,7 +196,7 @@ func TestHashPasswordAndVerify(t *testing.T) {
 				}
 
 				// Test VerifyPassword with incorrect password
-				valid, err = verifyPassword(hash, tc.password+"wrong")
+				valid, err = VerifyPassword(hash, tc.password+"wrong")
 				if err != nil {
 					t.Fatalf("VerifyPassword failed: %v", err)
 				}
@@ -299,7 +218,7 @@ func TestVerifyPassword_InvalidHash(t *testing.T) {
 	for _, invalidHash := range invalidHashes {
 		t.Run(
 			invalidHash, func(t *testing.T) {
-				_, err := verifyPassword(invalidHash, "anypassword")
+				_, err := VerifyPassword(invalidHash, "anypassword")
 				if err == nil {
 					t.Errorf(
 						"VerifyPassword should have failed for invalid hash: %s",
@@ -313,11 +232,11 @@ func TestVerifyPassword_InvalidHash(t *testing.T) {
 
 func TestHashPassword_Uniqueness(t *testing.T) {
 	password := "samepassword"
-	hash1, err := hashPassword(password)
+	hash1, err := HashPassword(password)
 	if err != nil {
 		t.Fatalf("HashPassword failed: %v", err)
 	}
-	hash2, err := hashPassword(password)
+	hash2, err := HashPassword(password)
 	if err != nil {
 		t.Fatalf("HashPassword failed: %v", err)
 	}
@@ -330,7 +249,7 @@ func TestHashPassword_Uniqueness(t *testing.T) {
 func BenchmarkHashPassword(b *testing.B) {
 	password := "benchmark_password"
 	for i := 0; i < b.N; i++ {
-		_, err := hashPassword(password)
+		_, err := HashPassword(password)
 		if err != nil {
 			b.Fatalf("HashPassword failed: %v", err)
 		}
@@ -339,14 +258,14 @@ func BenchmarkHashPassword(b *testing.B) {
 
 func BenchmarkVerifyPassword(b *testing.B) {
 	password := "benchmark_password"
-	hash, err := hashPassword(password)
+	hash, err := HashPassword(password)
 	if err != nil {
 		b.Fatalf("HashPassword failed: %v", err)
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err := verifyPassword(hash, password)
+		_, err := VerifyPassword(hash, password)
 		if err != nil {
 			b.Fatalf("VerifyPassword failed: %v", err)
 		}
@@ -444,6 +363,49 @@ func TestGenerateRandomHexString(t *testing.T) {
 	assert.Len(t, s, length)
 }
 
+func TestIsShutdownErr(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+
+	cancel(NewShutdownError("received shutdown signal"))
+	cc, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://example.com", http.NoBody)
+	require.NoError(t, err)
+	rv, err := http.DefaultClient.Do(cc)
+	if err != nil && rv != nil && rv.Body != nil {
+		t.Cleanup(
+			func() {
+				_ = rv.Body.Close()
+			},
+		)
+	}
+	assert.True(t, isShutdownErr(ctx, err))
+}
+
+// DefaultTestRuntimeConfig returns a default RuntimeConfig for testing purposes.
+// It primarily sets more verbose log levels and shorter poll intervals.
+func DefaultTestRuntimeConfig(t testing.TB) *RuntimeConfig {
+	t.Helper()
+	cfg := DefaultRuntimeConfig()
+
+	cfg.AssistantPollInterval = Duration{250 * time.Millisecond}
+	cfg.AssistantMaxPollInterval = Duration{250 * time.Millisecond}
+
+	logLevel := DBLogLevelWarn
+
+	cfg.LogLevel = logLevel
+	cfg.DiscordLogLevel = logLevel
+	cfg.DatabaseLogLevel = logLevel
+	cfg.DiscordGoLogLevel = logLevel
+	cfg.APILogLevel = logLevel
+	cfg.OpenAILogLevel = logLevel
+	cfg.RecoverPanic = false
+	cfg.AdminUsername = fmt.Sprintf("user_%s", t.Name())
+	password := fmt.Sprintf("password_%s", t.Name())
+	hashedPassword, err := HashPassword(password)
+	require.NoError(t, err)
+	cfg.AdminPassword = hashedPassword
+	return &cfg
+}
+
 // commandData holds common IDs, generated based on the current test
 type commandData struct {
 	RunID                string
@@ -513,17 +475,17 @@ func (c commandData) populateChatCommand(chatCommand *ChatCommand) *ChatCommand 
 
 	interaction := c.newChatCommandInteraction(c.t.Name())
 	u, err := NewUser(*interaction.User)
-	require.Nil(c.t, err)
+	require.NoError(c.t, err)
 
 	i := NewUserInteraction(interaction, u)
 
 	if chatCommand == nil {
 		chatCommand, err = NewChatCommand(u, interaction)
-		assert.NoError(c.t, err)
+		require.NoError(c.t, err)
 	}
 
 	interactionData, err := json.Marshal(i)
-	require.Nil(c.t, err)
+	require.NoError(c.t, err)
 	chatCommand.Content = string(interactionData)
 	chatCommand.ThreadID = c.ThreadID
 	chatCommand.MessageID = c.MessageID
@@ -537,7 +499,7 @@ func (c commandData) populateChatCommand(chatCommand *ChatCommand) *ChatCommand 
 	chatCommand.Token = c.DiscordToken
 	chatCommand.TokenExpires = time.Now().UTC().Add(15 * time.Minute).UnixMilli()
 	chatCommand.AppID = c.DiscordApplicationID
-	chatCommand.CommandContext = discordgo.InteractionContextType(discordgo.InteractionContextBotDM).String()
+	chatCommand.CommandContext = discordgo.InteractionContextBotDM.String()
 
 	return chatCommand
 }
@@ -567,4 +529,58 @@ func newCustomID(t testing.TB, reportType FeedbackButtonType) (
 		return customID, fmt.Errorf("custom_id too long")
 	}
 	return customID, nil
+}
+
+// gormDB creates a temporary SQLite database for testing purposes.
+//
+// The function creates a temporary directory, constructs a SQLite database file path within it,
+// and initializes the database using the CreateDB function. If there is an error during database
+// creation, the test fails with a fatal error.
+func gormDB(t testing.TB) *gorm.DB {
+	t.Helper()
+	tmpdir := t.TempDir()
+	dbfile := filepath.Join(tmpdir, fmt.Sprintf("%s.sqlite3", t.Name()))
+
+	db, err := CreateDB(context.Background(), "sqlite", dbfile)
+	if err != nil {
+		t.Fatalf("error creating db: %v", err)
+	}
+	return db
+}
+
+// setLoggers configures the loggers for the DisConcierge bot and its components.
+//
+// The function sets up loggers with test-specific attributes and reverts
+// the loggers to their original state when the test finishes.
+func setLoggers(t testing.TB, bot *DisConcierge) {
+	t.Helper()
+
+	originalDefault := slog.Default()
+	slog.SetDefault(originalDefault.With("test", t.Name()))
+	t.Cleanup(
+		func() {
+			slog.SetDefault(originalDefault)
+		},
+	)
+
+	baseLogger := bot.logger
+	bot.logger = baseLogger.With("test", t.Name())
+	bot.openai.logger = bot.openai.logger.With("test", t.Name())
+	bot.discord.logger = bot.discord.logger.With("test", t.Name())
+	bot.api.logger = bot.api.logger.With("test", t.Name())
+	dbLogHandler := tint.NewHandler(
+		os.Stdout, &tint.Options{
+			Level:     bot.config.DatabaseLogLevel,
+			AddSource: true,
+		},
+	).WithAttrs([]slog.Attr{slog.String("test", t.Name())})
+	if bot.db != nil {
+		bot.db.Logger = newGORMLogger(
+			dbLogHandler,
+			bot.config.DatabaseSlowThreshold,
+		)
+	}
+
+	discordgo.Logger = discordgoLoggerFunc(context.Background(), dbLogHandler)
+	bot.requestQueue.logger = bot.requestQueue.logger.With("test", t.Name())
 }

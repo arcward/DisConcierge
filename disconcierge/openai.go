@@ -16,6 +16,11 @@ import (
 	"time"
 )
 
+const (
+	assistantVersion = "v2"
+	openaiUserRole   = "user"
+)
+
 var (
 	openaiListMessageOrderAscending  = "asc"
 	openaiListRunStepsOrderAscending = "asc"
@@ -23,11 +28,6 @@ var (
 	openaiListMessageLimit           = 1
 	openaiAssistantRoleUser          = "user"
 	openaiAssistantRoleAssistant     = "assistant"
-)
-
-var (
-	ErrPollRunMaxErrorsExceeded = errors.New("poll run max errors exceeded")
-	ErrPollRunInterrupted       = errors.New("poll run interrupted")
 )
 
 // OpenAI represents the OpenAI integration for DisConcierge.
@@ -107,6 +107,7 @@ func (d *OpenAI) CreateThread(
 	}
 
 	if _, err := db.Update(
+		context.TODO(),
 		req,
 		columnChatCommandStep,
 		ChatCommandStepCreatingThread,
@@ -129,7 +130,7 @@ func (d *OpenAI) CreateThread(
 	thread.RequestEnded = time.Now().UnixMilli()
 	if err != nil {
 		thread.Error = err.Error()
-		if _, e := db.Create(thread); e != nil {
+		if _, e := db.Create(context.TODO(), thread); e != nil {
 			cmdLogger.ErrorContext(ctx, "error adding record", tint.Err(e))
 		}
 		return "", err
@@ -140,7 +141,7 @@ func (d *OpenAI) CreateThread(
 	}
 	thread.ResponseBody = string(data)
 	thread.ResponseHeaders = d.dumpHeaders(trv.Header())
-	if _, err = db.Create(thread); err != nil {
+	if _, err = db.Create(context.TODO(), thread); err != nil {
 		cmdLogger.ErrorContext(ctx, "error adding record", tint.Err(err))
 	}
 	return trv.ID, nil
@@ -171,7 +172,12 @@ func (d *OpenAI) CreateRun(ctx context.Context, db DBI, req *ChatCommand) (*open
 		ctx = WithLogger(ctx, cmdLogger)
 	}
 
-	if _, e := db.Update(req, columnChatCommandStep, ChatCommandStepCreatingRun); e != nil {
+	if _, e := db.Update(
+		context.TODO(),
+		req,
+		columnChatCommandStep,
+		ChatCommandStepCreatingRun,
+	); e != nil {
 		cmdLogger.ErrorContext(ctx, "error updating state", tint.Err(e))
 		return nil, e
 	}
@@ -221,7 +227,7 @@ func (d *OpenAI) CreateRun(ctx context.Context, db DBI, req *ChatCommand) (*open
 	err = d.waitOnRequestLimiter(tokenCtx)
 	if err != nil {
 		runRec.Error = err.Error()
-		if _, e := db.Create(runRec); e != nil {
+		if _, e := db.Create(context.TODO(), runRec); e != nil {
 			cmdLogger.ErrorContext(tokenCtx, "error adding record", tint.Err(e))
 		}
 		return nil, err
@@ -230,7 +236,7 @@ func (d *OpenAI) CreateRun(ctx context.Context, db DBI, req *ChatCommand) (*open
 	runRec.RequestStarted = time.Now().UnixMilli()
 
 	runResponse, createRunErr := d.client.CreateRun(
-		ctx,
+		context.Background(),
 		req.ThreadID,
 		runRequest,
 	)
@@ -251,7 +257,7 @@ func (d *OpenAI) CreateRun(ctx context.Context, db DBI, req *ChatCommand) (*open
 	}
 	runRec.ResponseBody = string(responseBody)
 
-	if _, err = db.Create(runRec); err != nil {
+	if _, err = db.Create(context.TODO(), runRec); err != nil {
 		cmdLogger.ErrorContext(tokenCtx, "error adding record", tint.Err(err))
 	}
 
@@ -293,6 +299,7 @@ func (d *OpenAI) CreateMessage(
 		ctx = WithLogger(ctx, cmdLogger)
 	}
 	if _, e := db.Update(
+		context.TODO(),
 		req,
 		columnChatCommandStep,
 		ChatCommandStepCreatingMessage,
@@ -340,7 +347,7 @@ func (d *OpenAI) CreateMessage(
 	}
 	msgRec.ResponseBody = string(data)
 
-	if _, err = db.Create(msgRec); err != nil {
+	if _, err = db.Create(context.TODO(), msgRec); err != nil {
 		cmdLogger.ErrorContext(ctx, "error adding record", tint.Err(err))
 	}
 	return msg.ID, createMsgErr
@@ -403,6 +410,7 @@ func (d *OpenAI) pollUpdateRunStatus(
 	}
 	if req.Step != ChatCommandStepPollingRun {
 		if _, err := db.Update(
+			context.TODO(),
 			req,
 			columnChatCommandStep,
 			ChatCommandStepPollingRun,
@@ -452,13 +460,18 @@ func (d *OpenAI) pollUpdateRunStatus(
 		ct++
 		select {
 		case <-ctx.Done():
-			logger.WarnContext(ctx, "polling interrupted")
-			return ErrPollRunInterrupted
+			return context.Cause(ctx)
 		case <-initialTick:
 			isDone, pollErr := d.executePoll(ctx, db, logger, req)
 			interval = updateInterval(logger, interval, maxInterval, pollErr)
 			if pollErr != nil {
+				if isShutdownErr(ctx, pollErr) {
+					return pollErr
+				} else if errors.Is(pollErr, context.DeadlineExceeded) {
+					return pollErr
+				}
 				errs = append(errs, pollErr)
+
 			}
 			if isDone {
 				return nil
@@ -468,7 +481,13 @@ func (d *OpenAI) pollUpdateRunStatus(
 			isDone, pollErr := d.executePoll(ctx, db, logger, req)
 			interval = updateInterval(logger, interval, maxInterval, pollErr)
 			if pollErr != nil {
+				if isShutdownErr(ctx, pollErr) {
+					return pollErr
+				} else if errors.Is(pollErr, context.DeadlineExceeded) {
+					return pollErr
+				}
 				errs = append(errs, pollErr)
+
 			}
 			if isDone {
 				return nil
@@ -519,10 +538,10 @@ func (d *OpenAI) pollUpdateRunStatus(
 //
 // This function is useful for detailed analysis and logging of the steps
 // taken during an OpenAI run.
-func (d *OpenAI) listRunSteps(
-	ctx context.Context,
-	req *ChatCommand,
-) ([]OpenAIListRunSteps, error) {
+func (d *OpenAI) listRunSteps(ctx context.Context, req *ChatCommand) (
+	[]OpenAIListRunSteps,
+	error,
+) {
 	p := openai.Pagination{
 		Limit: &openaiListRunStepsLimit,
 		Order: &openaiListRunStepsOrderAscending,
@@ -539,6 +558,8 @@ func (d *OpenAI) listRunSteps(
 		_ = d.dc.waitForPause(ctx)
 	}
 
+	seen := map[string]bool{}
+
 	for ctx.Err() == nil {
 		runStep := OpenAIListRunSteps{
 			OpenAIAPILog{
@@ -553,6 +574,7 @@ func (d *OpenAI) listRunSteps(
 			runStep.Error = err.Error()
 			return runSteps, err
 		}
+
 		data, err := json.Marshal(rv)
 		if err != nil {
 			runLogger.ErrorContext(ctx, "error marshaling run steps", tint.Err(err))
@@ -567,6 +589,11 @@ func (d *OpenAI) listRunSteps(
 			break
 		}
 		p.After = &rv.LastID
+		if seen[rv.LastID] {
+			break
+		} else {
+			seen[rv.LastID] = true
+		}
 	}
 	return runSteps, nil
 }
@@ -738,6 +765,7 @@ func (d *OpenAI) getMessageResponse(
 	req *ChatCommand,
 ) (string, error) {
 	if _, err := db.Update(
+		context.TODO(),
 		req,
 		columnChatCommandStep,
 		ChatCommandStepListMessage,
@@ -812,7 +840,7 @@ func (d *OpenAI) RetrieveRun(
 		runLogger.ErrorContext(ctx, "error marshaling run", tint.Err(err))
 	}
 	runRec.ResponseBody = string(data)
-	if _, err = db.Create(runRec); err != nil {
+	if _, err = db.Create(context.TODO(), runRec); err != nil {
 		runLogger.ErrorContext(ctx, "error adding record", tint.Err(err))
 	}
 	return &run, retrieveRunErr
@@ -894,7 +922,7 @@ func (d *OpenAI) ListMessage(
 	}
 	apiReq.ResponseBody = string(data)
 
-	if _, err = db.Create(&apiReq); err != nil {
+	if _, err = db.Create(context.TODO(), &apiReq); err != nil {
 		logger.ErrorContext(ctx, "error adding record", tint.Err(err))
 	}
 
@@ -928,7 +956,7 @@ func (*OpenAI) updateRunStatus(
 	}
 
 	if _, updErr := db.Updates(
-		req, map[string]any{
+		context.TODO(), req, map[string]any{
 			columnChatCommandRunStatus:             run.Status,
 			columnChatCommandUsagePromptTokens:     run.Usage.PromptTokens,
 			columnChatCommandUsageCompletionTokens: run.Usage.CompletionTokens,

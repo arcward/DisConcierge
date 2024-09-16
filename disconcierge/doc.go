@@ -6,7 +6,7 @@
 // configurations. The bot supports features such as chat commands, private
 // messaging, thread management, and user feedback collection.
 //
-// Key components of the package include:
+// KeyFile components of the package include:
 //
 //   - DisConcierge: The main struct that encapsulates the bot's core functionality.
 //   - Discord: Handles Discord integration and message processing.

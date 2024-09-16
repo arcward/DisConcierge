@@ -50,6 +50,11 @@ func TestAPILoginRateLimit(t *testing.T) {
 
 		bot.api.engine.ServeHTTP(w, req)
 		resp := w.Result()
+		t.Cleanup(
+			func() {
+				_ = resp.Body.Close()
+			},
+		)
 		return resp.StatusCode
 	}
 
@@ -136,11 +141,13 @@ func TestAPI_UserUpdate(t *testing.T) {
 
 	if !assert.Equal(t, http.StatusAccepted, rv.StatusCode) {
 		body := rv.Body
-		defer func() {
-			_ = body.Close()
-		}()
-		data, err := io.ReadAll(body)
-		require.NoError(t, err)
+		t.Cleanup(
+			func() {
+				_ = body.Close()
+			},
+		)
+		data, e := io.ReadAll(body)
+		require.NoError(t, e)
 		t.Fatalf(
 			"unexpected status code: %d (data: %s)",
 			rv.StatusCode,
@@ -217,7 +224,7 @@ func TestAPI_GetUsersWithStats(t *testing.T) {
 	)
 	require.NoError(t, err)
 	userFoo.CreatedAt = time.Now().Add(-time.Hour).UnixMilli()
-	_, err = bot.writeDB.Save(userFoo)
+	_, err = bot.writeDB.Save(context.TODO(), userFoo)
 	require.NoError(t, err)
 
 	chatCmdFoo := &ChatCommand{
@@ -233,11 +240,11 @@ func TestAPI_GetUsersWithStats(t *testing.T) {
 		UsageCompletionTokens: 25,
 		UsageTotalTokens:      50,
 	}
-	_, err = bot.writeDB.Create(chatCmdFoo, "User")
+	_, err = bot.writeDB.Create(context.TODO(), chatCmdFoo, "User")
 	require.NoError(t, err)
 
 	reportFoo := chatCmdFoo.createReport(UserFeedbackGood, "foo")
-	_, err = bot.writeDB.Create(&reportFoo)
+	_, err = bot.writeDB.Create(context.TODO(), &reportFoo)
 	require.NoError(t, err)
 
 	clearCmdFoo := &ClearCommand{
@@ -247,7 +254,7 @@ func TestAPI_GetUsersWithStats(t *testing.T) {
 			InteractionID: "fooClear",
 		},
 	}
-	_, err = bot.writeDB.Create(clearCmdFoo)
+	_, err = bot.writeDB.Create(context.TODO(), clearCmdFoo)
 	require.NoError(t, err)
 
 	userBar, _, err := bot.GetOrCreateUser(
@@ -270,15 +277,15 @@ func TestAPI_GetUsersWithStats(t *testing.T) {
 		UsageTotalTokens:      200,
 	}
 	chatCmdBar.CreatedAt = time.Now().Add(-(8 * time.Hour)).UnixMilli()
-	_, err = bot.writeDB.Create(chatCmdBar, "User")
+	_, err = bot.writeDB.Create(context.TODO(), chatCmdBar, "User")
 	require.NoError(t, err)
 
 	reportBarOutdated := chatCmdBar.createReport(UserFeedbackOutdated, "bar")
-	_, err = bot.writeDB.Create(&reportBarOutdated)
+	_, err = bot.writeDB.Create(context.TODO(), &reportBarOutdated)
 	require.NoError(t, err)
 
 	reportBarHallucinated := chatCmdBar.createReport(UserFeedbackHallucinated, "bar")
-	_, err = bot.writeDB.Create(&reportBarHallucinated)
+	_, err = bot.writeDB.Create(context.TODO(), &reportBarHallucinated)
 	require.NoError(t, err)
 
 	chatCmdBar2 := &ChatCommand{
@@ -296,7 +303,7 @@ func TestAPI_GetUsersWithStats(t *testing.T) {
 		UsageTotalTokens:      200,
 	}
 	chatCmdBar2.CreatedAt = time.Now().Add(-(3 * time.Hour)).UnixMilli()
-	_, err = bot.writeDB.Create(chatCmdBar2, "User")
+	_, err = bot.writeDB.Create(context.TODO(), chatCmdBar2, "User")
 	require.NoError(t, err)
 
 	var withStats []userWithStats
@@ -406,7 +413,7 @@ func TestAPI_GetUsersWithStats(t *testing.T) {
 func TestAPI_LoggedIn(t *testing.T) {
 	t.Parallel()
 	bot, _ := newDisConcierge(t)
-	bot.config.API.Development = false
+	bot.config.Development = false
 	requestLogin := func() *http.Response {
 		w := httptest.NewRecorder()
 		login := userLogin{
@@ -553,6 +560,144 @@ func TestAPI_RegisterCommands(t *testing.T) {
 		assert.NotNil(t, cmds)
 		assert.Equal(t, len(cmds), len(createdCommands))
 	}
+}
+
+func TestAPI_Login(t *testing.T) {
+	bot, _ := newDisConcierge(t)
+	handlers := NewAPIHandlers(bot)
+
+	bot.api.loginRequestLimiter = nil
+
+	t.Run(
+		"bad request", func(t *testing.T) {
+			payload := map[string]string{
+				"user":     "foo",
+				"password": "bar",
+			}
+			data, err := json.Marshal(payload)
+			require.NoError(t, err)
+
+			rv := handleTestRequest(
+				t,
+				handlers.loginHandler,
+				http.MethodPost,
+				bytes.NewReader(data),
+			)
+
+			assert.Equal(t, http.StatusBadRequest, rv.StatusCode)
+
+			body := rv.Body
+			t.Cleanup(
+				func() {
+					_ = body.Close()
+				},
+			)
+
+			bodyData, err := io.ReadAll(body)
+			require.NoError(t, err)
+			var responseData map[string]string
+			err = json.Unmarshal(bodyData, &responseData)
+			require.NoErrorf(t, err, "error on response data: %s", string(bodyData))
+			msg, ok := responseData["error"]
+			assert.True(t, ok)
+			assert.Equal(t, "Bad request", msg)
+		},
+	)
+
+	t.Run(
+		"no credentials set", func(t *testing.T) {
+			runtimeConfig := bot.runtimeConfig
+			originalUser := runtimeConfig.AdminUsername
+			originalPass := runtimeConfig.AdminPassword
+			runtimeConfig.AdminPassword = ""
+			runtimeConfig.AdminUsername = ""
+			t.Cleanup(
+				func() {
+					runtimeConfig.AdminPassword = originalPass
+					runtimeConfig.AdminUsername = originalUser
+				},
+			)
+
+			payload := map[string]string{
+				"username": "foo",
+				"password": "bar",
+			}
+			data, err := json.Marshal(payload)
+			require.NoError(t, err)
+
+			rv := handleTestRequest(
+				t,
+				handlers.loginHandler,
+				http.MethodPost,
+				bytes.NewReader(data),
+			)
+
+			assert.Equal(t, http.StatusUnauthorized, rv.StatusCode)
+
+			body := rv.Body
+			t.Cleanup(
+				func() {
+					_ = body.Close()
+				},
+			)
+
+			bodyData, err := io.ReadAll(body)
+			require.NoError(t, err)
+			var responseData map[string]string
+			err = json.Unmarshal(bodyData, &responseData)
+			require.NoErrorf(t, err, "error on response data: %s", string(bodyData))
+			msg, ok := responseData["error"]
+			assert.True(t, ok)
+			assert.Equal(t, "Unauthorized", msg)
+		},
+	)
+
+	t.Run(
+		"incorrect username", func(t *testing.T) {
+			runtimeConfig := bot.runtimeConfig
+			originalUser := runtimeConfig.AdminUsername
+
+			runtimeConfig.AdminUsername = originalUser + "asdf"
+			t.Cleanup(
+				func() {
+					runtimeConfig.AdminUsername = originalUser
+				},
+			)
+
+			payload := map[string]string{
+				"username": runtimeConfig.AdminUsername,
+				"password": "bar",
+			}
+			data, err := json.Marshal(payload)
+			require.NoError(t, err)
+
+			rv := handleTestRequest(
+				t,
+				handlers.loginHandler,
+				http.MethodPost,
+				bytes.NewReader(data),
+			)
+
+			assert.Equal(t, http.StatusUnauthorized, rv.StatusCode)
+
+			body := rv.Body
+			t.Cleanup(
+				func() {
+					_ = body.Close()
+				},
+			)
+
+			bodyData, err := io.ReadAll(body)
+			require.NoError(t, err)
+			var responseData map[string]string
+			err = json.Unmarshal(bodyData, &responseData)
+			require.NoErrorf(t, err, "error on response data: %s", string(bodyData))
+			msg, ok := responseData["error"]
+			assert.True(t, ok)
+			assert.Equal(t, "Unauthorized", msg)
+		},
+	)
+
 }
 
 func TestAPI_GetUserHistory(t *testing.T) {
@@ -1177,7 +1322,7 @@ func handleTestRequest(
 	params ...gin.Param,
 ) *http.Response {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	t.Cleanup(cancel)
 	doneCh := make(chan struct{}, 1)
 
@@ -1391,72 +1536,6 @@ func TestGetSessionUsername(t *testing.T) {
 			},
 		)
 	}
-}
-
-func TestAPI_AdminSetup_Forbidden(t *testing.T) {
-	bot, _ := newDisConcierge(t)
-	handlers := NewAPIHandlers(bot)
-	require.False(t, bot.pendingSetup.Load())
-	rv := handleTestRequest(
-		t,
-		handlers.adminSetup,
-		http.MethodPost,
-		http.NoBody,
-		gin.Param{},
-	)
-	require.Equal(t, http.StatusForbidden, rv.StatusCode)
-
-	var rvErr httpError
-	data, err := io.ReadAll(rv.Body)
-	t.Cleanup(
-		func() {
-			_ = rv.Body.Close()
-		},
-	)
-	require.NoError(t, err)
-	require.NoError(t, json.Unmarshal(data, &rvErr))
-
-	require.Equal(t, "Forbidden", rvErr.Error)
-}
-
-func TestAPI_AdminSetup_DBUpdateError(t *testing.T) {
-	bot, _ := newDisConciergePendingSetup(t, context.Background())
-	handlers := NewAPIHandlers(bot)
-	require.True(t, bot.pendingSetup.Load())
-	payload := adminSetupPayload{
-		Username:        t.Name(),
-		Password:        fmt.Sprintf("changeme"),
-		ConfirmPassword: fmt.Sprintf("changeme"),
-	}
-	payloadData, err := json.Marshal(payload)
-	require.NoError(t, err)
-	originalColumn := columnRuntimeConfigAdminPassword
-	columnRuntimeConfigAdminPassword = "admin_asdf"
-	t.Cleanup(
-		func() {
-			columnRuntimeConfigAdminPassword = originalColumn
-		},
-	)
-	rv := handleTestRequest(
-		t,
-		handlers.adminSetup,
-		http.MethodPost,
-		bytes.NewReader(payloadData),
-		gin.Param{},
-	)
-	require.Equal(t, http.StatusInternalServerError, rv.StatusCode)
-
-	var rvErr httpError
-	data, err := io.ReadAll(rv.Body)
-	t.Cleanup(
-		func() {
-			_ = rv.Body.Close()
-		},
-	)
-	require.NoError(t, err)
-	require.NoError(t, json.Unmarshal(data, &rvErr))
-
-	require.Equal(t, "error updating admin credentials", rvErr.Error)
 }
 
 func TestAPI_UpdateConfig_DiscordNotificationChannelID(t *testing.T) {
@@ -1674,7 +1753,7 @@ func TestAPI_GetChatCommands(t *testing.T) {
 		Prompt:                "Foo's first question",
 	}
 	chatCmdFoo1.CreatedAt = now.Add(-2 * (24 * time.Hour)).UnixMilli()
-	_, err = bot.writeDB.Create(chatCmdFoo1, "User")
+	_, err = bot.writeDB.Create(context.TODO(), chatCmdFoo1, "User")
 	require.NoError(t, err)
 
 	chatCmdFoo2 := &ChatCommand{
@@ -1692,7 +1771,7 @@ func TestAPI_GetChatCommands(t *testing.T) {
 		Prompt:                "Foo's second question",
 	}
 	chatCmdFoo2.CreatedAt = now.Add(-1 * (24 * time.Hour)).UnixMilli()
-	_, err = bot.writeDB.Create(chatCmdFoo2, "User")
+	_, err = bot.writeDB.Create(context.TODO(), chatCmdFoo2, "User")
 	require.NoError(t, err)
 
 	chatCmdBar := &ChatCommand{
@@ -1710,7 +1789,7 @@ func TestAPI_GetChatCommands(t *testing.T) {
 		Prompt:                "Bar's question",
 	}
 	chatCmdBar.CreatedAt = now.UnixMilli()
-	_, err = bot.writeDB.Create(chatCmdBar, "User")
+	_, err = bot.writeDB.Create(context.TODO(), chatCmdBar, "User")
 	require.NoError(t, err)
 
 	// Question order:
@@ -1859,7 +1938,7 @@ func TestAPI_GetChatCommandDetail(t *testing.T) {
 		UsageTotalTokens:      50,
 		Prompt:                "Test question",
 	}
-	_, err = bot.writeDB.Create(chatCmd, "User")
+	_, err = bot.writeDB.Create(context.TODO(), chatCmd, "User")
 	require.NoError(t, err)
 
 	// Create related OpenAI API call records
@@ -1870,7 +1949,7 @@ func TestAPI_GetChatCommandDetail(t *testing.T) {
 			ResponseBody:  "create thread response",
 		},
 	}
-	_, err = bot.writeDB.Create(createThread)
+	_, err = bot.writeDB.Create(context.TODO(), createThread)
 	require.NoError(t, err)
 
 	createMessage := &OpenAICreateMessage{
@@ -1880,7 +1959,7 @@ func TestAPI_GetChatCommandDetail(t *testing.T) {
 			ResponseBody:  "create message response",
 		},
 	}
-	_, err = bot.writeDB.Create(createMessage)
+	_, err = bot.writeDB.Create(context.TODO(), createMessage)
 	require.NoError(t, err)
 
 	listMessages := &OpenAIListMessages{
@@ -1890,7 +1969,7 @@ func TestAPI_GetChatCommandDetail(t *testing.T) {
 			ResponseBody:  "list messages response",
 		},
 	}
-	_, err = bot.writeDB.Create(listMessages)
+	_, err = bot.writeDB.Create(context.TODO(), listMessages)
 	require.NoError(t, err)
 
 	createRun := &OpenAICreateRun{
@@ -1900,7 +1979,7 @@ func TestAPI_GetChatCommandDetail(t *testing.T) {
 			ResponseBody:  "create run response",
 		},
 	}
-	_, err = bot.writeDB.Create(createRun)
+	_, err = bot.writeDB.Create(context.TODO(), createRun)
 	require.NoError(t, err)
 
 	retrieveRun := &OpenAIRetrieveRun{
@@ -1910,7 +1989,7 @@ func TestAPI_GetChatCommandDetail(t *testing.T) {
 			ResponseBody:  "retrieve run response",
 		},
 	}
-	_, err = bot.writeDB.Create(retrieveRun)
+	_, err = bot.writeDB.Create(context.TODO(), retrieveRun)
 	require.NoError(t, err)
 
 	listRunSteps := &OpenAIListRunSteps{
@@ -1920,7 +1999,7 @@ func TestAPI_GetChatCommandDetail(t *testing.T) {
 			ResponseBody:  "list run steps response",
 		},
 	}
-	_, err = bot.writeDB.Create(listRunSteps)
+	_, err = bot.writeDB.Create(context.TODO(), listRunSteps)
 	require.NoError(t, err)
 
 	// Test cases
@@ -2005,7 +2084,7 @@ func TestAPI_GetDiscordMessages(t *testing.T) {
 		{MessageID: "3", Content: "Test message 3", Payload: "Full payload 3"},
 	}
 	for _, msg := range sampleMessages {
-		_, err := bot.writeDB.Create(&msg)
+		_, err := bot.writeDB.Create(context.TODO(), &msg)
 		require.NoError(t, err)
 	}
 
@@ -2111,8 +2190,7 @@ func TestAPI_UpdateConfig_DiscordGateway(t *testing.T) {
 	bot, _ := newDisConcierge(t)
 	handlers := NewAPIHandlers(bot)
 
-	// Mock the Discord session
-	mockSession := &MockDiscordSession{}
+	mockSession := &MockDiscordSession{t: t, Calls: map[string][]string{}}
 	bot.discord.session = mockSession
 
 	baseConfig := *bot.runtimeConfig
@@ -2182,19 +2260,11 @@ func TestAPI_UpdateConfig_DiscordGateway(t *testing.T) {
 		t.Run(
 			tt.name, func(t *testing.T) {
 				// Reset mock and set initial state
-				mockSession.Reset()
+				mockSession = &MockDiscordSession{t: t}
+				bot.discord.session = mockSession
 
 				bot.runtimeConfig = &tt.initialState
 
-				t.Cleanup(
-					func() {
-						bot.triggerRuntimeConfigRefreshCh = make(chan bool, 1)
-						bot.triggerUserUpdatedRefreshCh = make(chan string, 1)
-						bot.triggerUserCacheRefreshCh = make(chan bool, 1)
-					},
-				)
-
-				// Prepare and send update request
 				payload, err := json.Marshal(tt.updatePayload)
 				require.NoError(t, err)
 
@@ -2205,13 +2275,30 @@ func TestAPI_UpdateConfig_DiscordGateway(t *testing.T) {
 					bytes.NewReader(payload),
 				)
 
-				// Check response
 				assert.Equal(t, http.StatusAccepted, resp.StatusCode)
 
-				// Verify expected calls
-				assert.Equal(t, tt.expectedCalls, mockSession.Calls)
+				timeoutCtx, timeoutCancel := context.WithTimeout(
+					context.Background(),
+					15*time.Second,
+				)
+				t.Cleanup(timeoutCancel)
+				doneCh := make(chan struct{}, 1)
+				go func() {
+					if len(mockSession.Calls[t.Name()]) >= len(tt.expectedCalls) {
+						doneCh <- struct{}{}
+						return
+					}
+				}()
 
-				// Check specific expectations
+				select {
+				case <-doneCh:
+				//
+				case <-timeoutCtx.Done():
+					assert.Equal(t, tt.expectedCalls, mockSession.Calls[t.Name()])
+					t.Fatalf("timed out waiting for calls")
+				}
+
+				assert.Equal(t, tt.expectedCalls, mockSession.Calls[t.Name()])
 				if tt.expectedStatus != "" {
 					assert.Equal(t, tt.expectedStatus, mockSession.LastStatus)
 				}
@@ -2247,38 +2334,55 @@ func TestAPI_UpdateConfig_DiscordGateway(t *testing.T) {
 // MockDiscordSession is a mock implementation of the DiscordSessionHandler interface
 type MockDiscordSession struct {
 	DiscordSessionHandler
-	Calls      []string
+	Calls map[string][]string
+
 	LastStatus string
+	t          testing.TB
+}
+
+func (m *MockDiscordSession) addCall(call string) {
+	m.t.Logf("adding call: %q", call)
+	if m.Calls == nil {
+		m.Calls = map[string][]string{}
+	}
+	_, ok := m.Calls[m.t.Name()]
+	if !ok {
+		m.Calls[m.t.Name()] = []string{}
+	}
+	m.Calls[m.t.Name()] = append(m.Calls[m.t.Name()], call)
+
+	// m.Calls = append(m.Calls, call)
 }
 
 func (m *MockDiscordSession) Close() error {
-	m.Calls = append(m.Calls, "Close")
+	m.addCall("Close")
 	return nil
 }
 
 func (m *MockDiscordSession) Open() error {
-	m.Calls = append(m.Calls, "Open")
+	m.addCall("Open")
 	return nil
 }
 
 func (m *MockDiscordSession) UpdateStatusComplex(data discordgo.UpdateStatusData) error {
-	m.Calls = append(m.Calls, "UpdateStatusComplex")
+	m.addCall("UpdateStatusComplex")
 	m.LastStatus = data.Status
 	return nil
 }
 
 func (m *MockDiscordSession) UpdateCustomStatus(status string) error {
-	m.Calls = append(m.Calls, "UpdateCustomStatus")
+	m.addCall("UpdateCustomStatus")
 	m.LastStatus = status
 	return nil
 }
 
 func (m *MockDiscordSession) SetIdentify(discordgo.Identify) {
-	m.Calls = append(m.Calls, "SetIdentify")
+	m.addCall("SetIdentify")
 }
 
 func (m *MockDiscordSession) Reset() {
-	m.Calls = []string{}
+	m.t.Logf("reset calls")
+	m.Calls[m.t.Name()] = []string{}
 	m.LastStatus = ""
 }
 
@@ -2314,7 +2418,7 @@ func TestAPI_GetOpenAIRetrieveRunLogs(t *testing.T) {
 		RunID:    "runFoo",
 	}
 	chatCmdFoo.CreatedAt = now.Add(-1 * (24 * time.Hour)).UnixMilli()
-	_, err = bot.writeDB.Create(chatCmdFoo, "User")
+	_, err = bot.writeDB.Create(context.TODO(), chatCmdFoo, "User")
 	require.NoError(t, err)
 
 	chatCmdBar := &ChatCommand{
@@ -2328,7 +2432,7 @@ func TestAPI_GetOpenAIRetrieveRunLogs(t *testing.T) {
 		RunID:    "runBar",
 	}
 	chatCmdBar.CreatedAt = now.UnixMilli()
-	_, err = bot.writeDB.Create(chatCmdBar, "User")
+	_, err = bot.writeDB.Create(context.TODO(), chatCmdBar, "User")
 	require.NoError(t, err)
 
 	// Create test OpenAIRetrieveRun records
@@ -2339,7 +2443,7 @@ func TestAPI_GetOpenAIRetrieveRunLogs(t *testing.T) {
 			RequestEnded:   now.Add(-1 * (24 * time.Hour)).Add(1 * time.Second).UnixMilli(),
 		},
 	}
-	_, err = bot.writeDB.Create(retrieveRunFoo1)
+	_, err = bot.writeDB.Create(context.TODO(), retrieveRunFoo1)
 	require.NoError(t, err)
 
 	retrieveRunFoo2 := &OpenAIRetrieveRun{
@@ -2349,7 +2453,7 @@ func TestAPI_GetOpenAIRetrieveRunLogs(t *testing.T) {
 			RequestEnded:   now.Add(-23 * time.Hour).Add(1 * time.Second).UnixMilli(),
 		},
 	}
-	_, err = bot.writeDB.Create(retrieveRunFoo2)
+	_, err = bot.writeDB.Create(context.TODO(), retrieveRunFoo2)
 	require.NoError(t, err)
 
 	retrieveRunBar := &OpenAIRetrieveRun{
@@ -2359,7 +2463,7 @@ func TestAPI_GetOpenAIRetrieveRunLogs(t *testing.T) {
 			RequestEnded:   now.Add(1 * time.Second).UnixMilli(),
 		},
 	}
-	_, err = bot.writeDB.Create(retrieveRunBar)
+	_, err = bot.writeDB.Create(context.TODO(), retrieveRunBar)
 	require.NoError(t, err)
 
 	// Test cases
@@ -2502,7 +2606,7 @@ func TestAPI_GetOpenAICreateThreadLogs(t *testing.T) {
 		RunID:    "runFoo",
 	}
 	chatCmdFoo.CreatedAt = now.Add(-1 * (24 * time.Hour)).UnixMilli()
-	_, err = bot.writeDB.Create(chatCmdFoo, "User")
+	_, err = bot.writeDB.Create(context.TODO(), chatCmdFoo, "User")
 	require.NoError(t, err)
 
 	chatCmdBar := &ChatCommand{
@@ -2516,7 +2620,7 @@ func TestAPI_GetOpenAICreateThreadLogs(t *testing.T) {
 		RunID:    "runBar",
 	}
 	chatCmdBar.CreatedAt = now.UnixMilli()
-	_, err = bot.writeDB.Create(chatCmdBar, "User")
+	_, err = bot.writeDB.Create(context.TODO(), chatCmdBar, "User")
 	require.NoError(t, err)
 
 	// Create test OpenAICreateThread records
@@ -2527,7 +2631,7 @@ func TestAPI_GetOpenAICreateThreadLogs(t *testing.T) {
 			RequestEnded:   now.Add(-1 * (24 * time.Hour)).Add(1 * time.Second).UnixMilli(),
 		},
 	}
-	_, err = bot.writeDB.Create(createThreadFoo1)
+	_, err = bot.writeDB.Create(context.TODO(), createThreadFoo1)
 	require.NoError(t, err)
 
 	createThreadFoo2 := &OpenAICreateThread{
@@ -2537,7 +2641,7 @@ func TestAPI_GetOpenAICreateThreadLogs(t *testing.T) {
 			RequestEnded:   now.Add(-23 * time.Hour).Add(1 * time.Second).UnixMilli(),
 		},
 	}
-	_, err = bot.writeDB.Create(createThreadFoo2)
+	_, err = bot.writeDB.Create(context.TODO(), createThreadFoo2)
 	require.NoError(t, err)
 
 	createThreadBar := &OpenAICreateThread{
@@ -2547,7 +2651,7 @@ func TestAPI_GetOpenAICreateThreadLogs(t *testing.T) {
 			RequestEnded:   now.Add(1 * time.Second).UnixMilli(),
 		},
 	}
-	_, err = bot.writeDB.Create(createThreadBar)
+	_, err = bot.writeDB.Create(context.TODO(), createThreadBar)
 	require.NoError(t, err)
 
 	// Test cases
@@ -2690,7 +2794,7 @@ func TestAPI_GetOpenAICreateMessageLogs(t *testing.T) {
 		RunID:    "runFoo",
 	}
 	chatCmdFoo.CreatedAt = now.Add(-1 * (24 * time.Hour)).UnixMilli()
-	_, err = bot.writeDB.Create(chatCmdFoo, "User")
+	_, err = bot.writeDB.Create(context.TODO(), chatCmdFoo, "User")
 	require.NoError(t, err)
 
 	chatCmdBar := &ChatCommand{
@@ -2704,7 +2808,7 @@ func TestAPI_GetOpenAICreateMessageLogs(t *testing.T) {
 		RunID:    "runBar",
 	}
 	chatCmdBar.CreatedAt = now.UnixMilli()
-	_, err = bot.writeDB.Create(chatCmdBar, "User")
+	_, err = bot.writeDB.Create(context.TODO(), chatCmdBar, "User")
 	require.NoError(t, err)
 
 	// Create test OpenAICreateMessage records
@@ -2715,7 +2819,7 @@ func TestAPI_GetOpenAICreateMessageLogs(t *testing.T) {
 			RequestEnded:   now.Add(-1 * (24 * time.Hour)).Add(1 * time.Second).UnixMilli(),
 		},
 	}
-	_, err = bot.writeDB.Create(createMessageFoo1)
+	_, err = bot.writeDB.Create(context.TODO(), createMessageFoo1)
 	require.NoError(t, err)
 
 	createMessageFoo2 := &OpenAICreateMessage{
@@ -2725,7 +2829,7 @@ func TestAPI_GetOpenAICreateMessageLogs(t *testing.T) {
 			RequestEnded:   now.Add(-23 * time.Hour).Add(1 * time.Second).UnixMilli(),
 		},
 	}
-	_, err = bot.writeDB.Create(createMessageFoo2)
+	_, err = bot.writeDB.Create(context.TODO(), createMessageFoo2)
 	require.NoError(t, err)
 
 	createMessageBar := &OpenAICreateMessage{
@@ -2735,7 +2839,7 @@ func TestAPI_GetOpenAICreateMessageLogs(t *testing.T) {
 			RequestEnded:   now.Add(1 * time.Second).UnixMilli(),
 		},
 	}
-	_, err = bot.writeDB.Create(createMessageBar)
+	_, err = bot.writeDB.Create(context.TODO(), createMessageBar)
 	require.NoError(t, err)
 
 	// Test cases
@@ -2878,7 +2982,7 @@ func TestAPI_GetOpenAICreateRunLogs(t *testing.T) {
 		RunID:    "runFoo",
 	}
 	chatCmdFoo.CreatedAt = now.Add(-1 * (24 * time.Hour)).UnixMilli()
-	_, err = bot.writeDB.Create(chatCmdFoo, "User")
+	_, err = bot.writeDB.Create(context.TODO(), chatCmdFoo, "User")
 	require.NoError(t, err)
 
 	chatCmdBar := &ChatCommand{
@@ -2892,7 +2996,7 @@ func TestAPI_GetOpenAICreateRunLogs(t *testing.T) {
 		RunID:    "runBar",
 	}
 	chatCmdBar.CreatedAt = now.UnixMilli()
-	_, err = bot.writeDB.Create(chatCmdBar, "User")
+	_, err = bot.writeDB.Create(context.TODO(), chatCmdBar, "User")
 	require.NoError(t, err)
 
 	// Create test OpenAICreateRun records
@@ -2903,7 +3007,7 @@ func TestAPI_GetOpenAICreateRunLogs(t *testing.T) {
 			RequestEnded:   now.Add(-1 * (24 * time.Hour)).Add(1 * time.Second).UnixMilli(),
 		},
 	}
-	_, err = bot.writeDB.Create(createRunFoo1)
+	_, err = bot.writeDB.Create(context.TODO(), createRunFoo1)
 	require.NoError(t, err)
 
 	createRunFoo2 := &OpenAICreateRun{
@@ -2913,7 +3017,7 @@ func TestAPI_GetOpenAICreateRunLogs(t *testing.T) {
 			RequestEnded:   now.Add(-23 * time.Hour).Add(1 * time.Second).UnixMilli(),
 		},
 	}
-	_, err = bot.writeDB.Create(createRunFoo2)
+	_, err = bot.writeDB.Create(context.TODO(), createRunFoo2)
 	require.NoError(t, err)
 
 	createRunBar := &OpenAICreateRun{
@@ -2923,7 +3027,7 @@ func TestAPI_GetOpenAICreateRunLogs(t *testing.T) {
 			RequestEnded:   now.Add(1 * time.Second).UnixMilli(),
 		},
 	}
-	_, err = bot.writeDB.Create(createRunBar)
+	_, err = bot.writeDB.Create(context.TODO(), createRunBar)
 	require.NoError(t, err)
 
 	// Test cases
@@ -3066,7 +3170,7 @@ func TestAPI_GetOpenAIListMessagesLogs(t *testing.T) {
 		RunID:    "runFoo",
 	}
 	chatCmdFoo.CreatedAt = now.Add(-1 * (24 * time.Hour)).UnixMilli()
-	_, err = bot.writeDB.Create(chatCmdFoo, "User")
+	_, err = bot.writeDB.Create(context.TODO(), chatCmdFoo, "User")
 	require.NoError(t, err)
 
 	chatCmdBar := &ChatCommand{
@@ -3080,7 +3184,7 @@ func TestAPI_GetOpenAIListMessagesLogs(t *testing.T) {
 		RunID:    "runBar",
 	}
 	chatCmdBar.CreatedAt = now.UnixMilli()
-	_, err = bot.writeDB.Create(chatCmdBar, "User")
+	_, err = bot.writeDB.Create(context.TODO(), chatCmdBar, "User")
 	require.NoError(t, err)
 
 	// Create test OpenAIListMessages records
@@ -3091,7 +3195,7 @@ func TestAPI_GetOpenAIListMessagesLogs(t *testing.T) {
 			RequestEnded:   now.Add(-1 * (24 * time.Hour)).Add(1 * time.Second).UnixMilli(),
 		},
 	}
-	_, err = bot.writeDB.Create(listMessagesFoo1)
+	_, err = bot.writeDB.Create(context.TODO(), listMessagesFoo1)
 	require.NoError(t, err)
 
 	listMessagesFoo2 := &OpenAIListMessages{
@@ -3101,7 +3205,7 @@ func TestAPI_GetOpenAIListMessagesLogs(t *testing.T) {
 			RequestEnded:   now.Add(-23 * time.Hour).Add(1 * time.Second).UnixMilli(),
 		},
 	}
-	_, err = bot.writeDB.Create(listMessagesFoo2)
+	_, err = bot.writeDB.Create(context.TODO(), listMessagesFoo2)
 	require.NoError(t, err)
 
 	listMessagesBar := &OpenAIListMessages{
@@ -3111,7 +3215,7 @@ func TestAPI_GetOpenAIListMessagesLogs(t *testing.T) {
 			RequestEnded:   now.Add(1 * time.Second).UnixMilli(),
 		},
 	}
-	_, err = bot.writeDB.Create(listMessagesBar)
+	_, err = bot.writeDB.Create(context.TODO(), listMessagesBar)
 	require.NoError(t, err)
 
 	// Test cases
@@ -3254,7 +3358,7 @@ func TestAPI_GetOpenAIListRunStepsLogs(t *testing.T) {
 		RunID:    "runFoo",
 	}
 	chatCmdFoo.CreatedAt = now.Add(-1 * (24 * time.Hour)).UnixMilli()
-	_, err = bot.writeDB.Create(chatCmdFoo, "User")
+	_, err = bot.writeDB.Create(context.TODO(), chatCmdFoo, "User")
 	require.NoError(t, err)
 
 	chatCmdBar := &ChatCommand{
@@ -3268,7 +3372,7 @@ func TestAPI_GetOpenAIListRunStepsLogs(t *testing.T) {
 		RunID:    "runBar",
 	}
 	chatCmdBar.CreatedAt = now.UnixMilli()
-	_, err = bot.writeDB.Create(chatCmdBar, "User")
+	_, err = bot.writeDB.Create(context.TODO(), chatCmdBar, "User")
 	require.NoError(t, err)
 
 	// Create test OpenAIListRunSteps records
@@ -3279,7 +3383,7 @@ func TestAPI_GetOpenAIListRunStepsLogs(t *testing.T) {
 			RequestEnded:   now.Add(-1 * (24 * time.Hour)).Add(1 * time.Second).UnixMilli(),
 		},
 	}
-	_, err = bot.writeDB.Create(listRunStepsFoo1)
+	_, err = bot.writeDB.Create(context.TODO(), listRunStepsFoo1)
 	require.NoError(t, err)
 
 	listRunStepsFoo2 := &OpenAIListRunSteps{
@@ -3289,7 +3393,7 @@ func TestAPI_GetOpenAIListRunStepsLogs(t *testing.T) {
 			RequestEnded:   now.Add(-23 * time.Hour).Add(1 * time.Second).UnixMilli(),
 		},
 	}
-	_, err = bot.writeDB.Create(listRunStepsFoo2)
+	_, err = bot.writeDB.Create(context.TODO(), listRunStepsFoo2)
 	require.NoError(t, err)
 
 	listRunStepsBar := &OpenAIListRunSteps{
@@ -3299,7 +3403,7 @@ func TestAPI_GetOpenAIListRunStepsLogs(t *testing.T) {
 			RequestEnded:   now.Add(1 * time.Second).UnixMilli(),
 		},
 	}
-	_, err = bot.writeDB.Create(listRunStepsBar)
+	_, err = bot.writeDB.Create(context.TODO(), listRunStepsBar)
 	require.NoError(t, err)
 
 	// Test cases
@@ -3473,7 +3577,7 @@ func TestAPI_GetUserFeedback(t *testing.T) {
 		RunID:    "runFoo",
 	}
 	chatCmdFoo.CreatedAt = now.Add(-1 * (24 * time.Hour)).UnixMilli()
-	_, err = bot.writeDB.Create(chatCmdFoo, "User")
+	_, err = bot.writeDB.Create(context.TODO(), chatCmdFoo, "User")
 	require.NoError(t, err)
 
 	chatCmdBar := &ChatCommand{
@@ -3487,7 +3591,7 @@ func TestAPI_GetUserFeedback(t *testing.T) {
 		RunID:    "runBar",
 	}
 	chatCmdBar.CreatedAt = now.UnixMilli()
-	_, err = bot.writeDB.Create(chatCmdBar, "User")
+	_, err = bot.writeDB.Create(context.TODO(), chatCmdBar, "User")
 	require.NoError(t, err)
 
 	// Create test UserFeedback records
@@ -3498,7 +3602,7 @@ func TestAPI_GetUserFeedback(t *testing.T) {
 		Description:   "Good response",
 		ModelUnixTime: ModelUnixTime{CreatedAt: now.Add(-1 * (24 * time.Hour)).UnixMilli()},
 	}
-	_, err = bot.writeDB.Create(feedbackFoo1)
+	_, err = bot.writeDB.Create(context.TODO(), feedbackFoo1)
 	require.NoError(t, err)
 
 	feedbackFoo2 := &UserFeedback{
@@ -3508,7 +3612,7 @@ func TestAPI_GetUserFeedback(t *testing.T) {
 		Description:   "Information is outdated",
 		ModelUnixTime: ModelUnixTime{CreatedAt: now.Add(-23 * time.Hour).UnixMilli()},
 	}
-	_, err = bot.writeDB.Create(feedbackFoo2)
+	_, err = bot.writeDB.Create(context.TODO(), feedbackFoo2)
 	require.NoError(t, err)
 
 	feedbackBar := &UserFeedback{
@@ -3518,7 +3622,7 @@ func TestAPI_GetUserFeedback(t *testing.T) {
 		Description:   "Response contains inaccuracies",
 		ModelUnixTime: ModelUnixTime{CreatedAt: now.UnixMilli()},
 	}
-	_, err = bot.writeDB.Create(feedbackBar)
+	_, err = bot.writeDB.Create(context.TODO(), feedbackBar)
 	require.NoError(t, err)
 
 	// Test cases
@@ -3664,7 +3768,7 @@ func TestAPIHandlers_ReloadUsers(t *testing.T) {
 	assert.True(t, isNew)
 
 	// Modify a user directly in the database
-	_, err = bot.writeDB.Update(userFoo, "username", "Updated Foo User")
+	_, err = bot.writeDB.Update(context.TODO(), userFoo, "username", "Updated Foo User")
 	require.NoError(t, err)
 
 	// Add a new user directly to the database
@@ -3672,7 +3776,7 @@ func TestAPIHandlers_ReloadUsers(t *testing.T) {
 		ID:       "baz",
 		Username: "Baz User",
 	}
-	_, err = bot.writeDB.Create(newUser)
+	_, err = bot.writeDB.Create(context.TODO(), newUser)
 	require.NoError(t, err)
 
 	// Call the reloadUsers handler
@@ -3732,4 +3836,109 @@ func TestAPIHandlers_ReloadUsers(t *testing.T) {
 		"Foo user in cache should have updated username",
 	)
 	assert.NotNil(t, cachedUsers["baz"], "Baz user should be present in the cache")
+}
+
+func TestAPIHandlers_UserFeedbackByID(t *testing.T) {
+	t.Parallel()
+	bot, _ := newDisConcierge(t)
+	handlers := NewAPIHandlers(bot)
+
+	// Create test user
+	user, _, err := bot.GetOrCreateUser(
+		context.Background(),
+		discordgo.User{ID: "testuser", Username: "Test User"},
+	)
+	require.NoError(t, err)
+
+	// Create test ChatCommand
+	chatCmd := &ChatCommand{
+		Interaction: Interaction{
+			User:          user,
+			UserID:        user.ID,
+			InteractionID: "test-interaction",
+		},
+		State:    ChatCommandStateCompleted,
+		ThreadID: "test-thread",
+		RunID:    "test-run",
+		Prompt:   "Test question",
+	}
+	_, err = bot.writeDB.Create(context.TODO(), chatCmd, "User")
+	require.NoError(t, err)
+
+	// Create test UserFeedback
+	userFeedback := &UserFeedback{
+		ChatCommandID: &chatCmd.ID,
+		UserID:        &user.ID,
+		Type:          string(UserFeedbackGood),
+		Description:   "Good response",
+		Detail:        "The response was very helpful",
+	}
+	_, err = bot.writeDB.Create(context.TODO(), userFeedback)
+	require.NoError(t, err)
+
+	// Test cases
+	testCases := []struct {
+		name           string
+		id             string
+		expectedStatus int
+		validate       func(t *testing.T, detail UserFeedback)
+	}{
+		{
+			name:           "Valid UserFeedback ID",
+			id:             fmt.Sprintf("%d", userFeedback.ID),
+			expectedStatus: http.StatusOK,
+			validate: func(t *testing.T, detail UserFeedback) {
+				assert.Equal(t, userFeedback.ID, detail.ID)
+				require.NotNil(t, detail.ChatCommandID)
+				assert.Equal(t, *userFeedback.ChatCommandID, *detail.ChatCommandID)
+				require.NotNil(t, detail.UserID)
+				assert.Equal(t, *userFeedback.UserID, *detail.UserID)
+				assert.Equal(t, userFeedback.Type, detail.Type)
+				assert.Equal(t, userFeedback.Description, detail.Description)
+				assert.Equal(t, userFeedback.Detail, detail.Detail)
+			},
+		},
+		{
+			name:           "Invalid UserFeedback ID",
+			id:             "999999",
+			expectedStatus: http.StatusNotFound,
+		},
+		{
+			name:           "Invalid ID format",
+			id:             "not-a-number",
+			expectedStatus: http.StatusBadRequest,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(
+			tc.name, func(t *testing.T) {
+				req, err := http.NewRequest(
+					http.MethodGet,
+					fmt.Sprintf("%s/user_feedback/%s", apiPrefix, tc.id),
+					http.NoBody,
+				)
+				require.NoError(t, err)
+
+				resp := handleTestHTTPRequest(
+					t,
+					handlers.userFeedbackByID,
+					req,
+					gin.Param{Key: "id", Value: tc.id},
+				)
+
+				assert.Equal(t, tc.expectedStatus, resp.StatusCode)
+
+				if tc.expectedStatus == http.StatusOK {
+					var detail UserFeedback
+					err = json.NewDecoder(resp.Body).Decode(&detail)
+					require.NoError(t, err)
+
+					if tc.validate != nil {
+						tc.validate(t, detail)
+					}
+				}
+			},
+		)
+	}
 }

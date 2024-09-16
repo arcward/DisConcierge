@@ -24,7 +24,7 @@ func discordgoLoggerFunc(ctx context.Context, handler slog.Handler) func(
 	log := slog.New(handler)
 	return func(
 		msgL int,
-		caller int,
+		_ int,
 		format string,
 		args ...any,
 	) {
@@ -79,7 +79,7 @@ func (DBLogLevel) GormDataType() string {
 	return "string"
 }
 
-// MarshalJSON implements the json.Marshaler interface.
+// MarshalJSON implements the json.Marshaller interface.
 func (l DBLogLevel) MarshalJSON() ([]byte, error) {
 	return json.Marshal(l.String())
 }

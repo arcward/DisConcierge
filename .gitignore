@@ -120,3 +120,4 @@ go.work
 files/
 data/
 disconcierge.yaml
+.env

@@ -15,7 +15,6 @@ LDFLAGS := -X main.Version=$(VERSION) -X main.CommitSHA=$(COMMIT_SHA) -X main.Bu
 
 
 .PHONY: all
-all: build
 
 .PHONY: install-frontend
 install-frontend:

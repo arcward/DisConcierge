@@ -1,17 +1,15 @@
 package disconcierge
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"github.com/bwmarrin/discordgo"
 	"gorm.io/gorm"
 	"log/slog"
 	"strings"
-)
-
-var (
-	columnUserFeedbackType = "type"
 )
 
 var (
@@ -27,11 +25,6 @@ var (
 
 	// UserFeedbackOther indicates other types of feedback not covered by the above categories.
 	UserFeedbackOther FeedbackButtonType = "O"
-
-	// UserFeedbackReset represents an action to undo a previous feedback submission.
-	// This only applies for `/private` commands, and `/chat` commands used
-	// in the context of a DM.
-	UserFeedbackReset FeedbackButtonType = "U"
 )
 
 var feedbackTypeDescription = map[FeedbackButtonType]string{
@@ -39,30 +32,7 @@ var feedbackTypeDescription = map[FeedbackButtonType]string{
 	UserFeedbackOutdated:     "Outdated",
 	UserFeedbackHallucinated: "Inaccurate",
 	UserFeedbackOther:        "Other",
-	UserFeedbackReset:        "Reset",
 }
-
-// FeedbackButtonState indicates whether a user feedback button should
-// be shown and enabled, shown but disabled, or hidden entirely.
-type FeedbackButtonState int
-
-func (f FeedbackButtonState) String() string {
-	switch f {
-	case FeedbackButtonStateHidden:
-		return "Hidden"
-	case FeedbackButtonStateEnabled:
-		return "Enabled"
-	case FeedbackButtonStateDisabled:
-		return "Disabled"
-	}
-	return "Unknown"
-}
-
-const (
-	FeedbackButtonStateHidden FeedbackButtonState = iota
-	FeedbackButtonStateEnabled
-	FeedbackButtonStateDisabled
-)
 
 // FeedbackButtonType represents the type of feedback button used in Discord interactions.
 //
@@ -246,4 +216,58 @@ func generateRandomHexString(length int) (string, error) {
 	}
 	hexString := hex.EncodeToString(bytes)
 	return hexString, nil
+}
+
+func GetFeedbackCounts(
+	ctx context.Context,
+	db *gorm.DB,
+	chatCommandID uint,
+) (map[FeedbackButtonType]int64, error) {
+	feedbackCounts := make(map[FeedbackButtonType]int64)
+	// Query for counts of UserFeedback records for each FeedbackButtonType
+	var results []struct {
+		Type  string
+		Count int64
+	}
+	err := db.WithContext(ctx).Model(&UserFeedback{}).
+		Select("type, COUNT(*) as count").
+		Where("chat_command_id = ?", chatCommandID).
+		Group("type").
+		Find(&results).Error
+	if err != nil {
+		return nil, err
+	}
+
+	// Populate the map with the results
+	for _, result := range results {
+		feedbackCounts[FeedbackButtonType(result.Type)] = result.Count
+	}
+	return feedbackCounts, nil
+}
+
+func UserPreviouslySubmittedFeedback(
+	ctx context.Context,
+	db *gorm.DB,
+	userID string,
+	chatCommandID uint,
+	feedbackType FeedbackButtonType,
+) (bool, error) {
+
+	err := db.WithContext(ctx).Model(&UserFeedback{}).
+		Where(
+			"user_id = ? AND chat_command_id = ? AND type = ?",
+			userID,
+			chatCommandID,
+			string(feedbackType),
+		).
+		Take(&UserFeedback{}).Error
+
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return false, nil
+		}
+		return false, err
+
+	}
+	return true, nil
 }

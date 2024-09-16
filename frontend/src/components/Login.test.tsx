@@ -12,7 +12,7 @@ jest.mock('../authContext', () => ({
 }));
 
 jest.mock('../api/apiClient', () => ({
-    setupRequired: jest.fn().mockResolvedValue({required: false}),
+
     loggedIn: jest.fn().mockResolvedValue({username: 'testuser'}),
 }));
 

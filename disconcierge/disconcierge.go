@@ -3,13 +3,13 @@ package disconcierge
 import (
 	"context"
 	_ "embed"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/bwmarrin/discordgo"
 	"github.com/gin-gonic/gin"
 	"github.com/lmittmann/tint"
 	openai "github.com/sashabaranov/go-openai"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/time/rate"
 	"gorm.io/gorm"
 	"io"
@@ -17,15 +17,9 @@ import (
 	"net/http"
 	"os"
 	"runtime/debug"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-)
-
-const (
-	assistantVersion = "v2"
-	openaiUserRole   = "user"
 )
 
 var (
@@ -35,9 +29,7 @@ var (
 	Version   = "dev"
 	CommitSHA = "unknown"
 	BuildTime = "unknown"
-)
 
-var (
 	// WaitForResumeCheckInterval is the duration to sleep between checking
 	// whether the bot has been un-paused/resumed (when [RuntimeConfig.Paused is
 	// no longer true).
@@ -46,24 +38,52 @@ var (
 	// Until then, it will check every [WaitForResumeCheckInterval] to see if
 	// it's been un-paused/resumed.
 	WaitForResumeCheckInterval = 5 * time.Second
-	UserWorkerSendTimeout      = time.Second
-)
 
-var (
-	ErrChatCommandTooOld = errors.New("request too old")
-)
+	// UserWorkerSendTimeout is the amount of time to wait when sending
+	// a ChatCommand or ClearCommand to userCommandWorker.clearCh or
+	// userCommandWorker.chatCh before abandoning the request. This is
+	// intended to prevent users from running multiple commands concurrently,
+	// which still allowing some wiggle room for a slow receiver. Set this
+	// too low, and the user receives false-positive rate limits... set it too
+	// high, the user will be able to 'queue' multiple commands.
+	UserWorkerSendTimeout = time.Second
 
-var (
 	// busyInteractionDeleteDelay is the amount of time to wait
 	// before deleting a 'busy' interaction that was sent to
 	// the user (ex: when they use /chat while their previous
 	// /chat hasn't finished yet)
 	busyInteractionDeleteDelay = 20 * time.Second
+
+	// ShutdownAnnouncementInterval logs a message at this interval when
+	// a graceful shutdown is initiated, providing a countdown to the
+	// time a forced shutdown would take place if the shutdown is taking
+	// too long
+	ShutdownAnnouncementInterval = 10 * time.Second
+
+	UpdateExpiredRunCheckInterval           = 30 * time.Minute
+	ErrChatCommandTooOld                    = errors.New("request too old")
+	defaultLogWriter              io.Writer = os.Stdout
 )
 
-var (
-	defaultLogWriter io.Writer = os.Stdout
-)
+type ShutdownError struct {
+	message string
+	cause   error
+}
+
+func (e *ShutdownError) Error() string {
+	return e.message
+}
+
+func (e *ShutdownError) Unwrap() error {
+	return e.cause
+}
+
+func NewShutdownError(msg string) *ShutdownError {
+	return &ShutdownError{
+		message: msg,
+		cause:   context.Canceled,
+	}
+}
 
 // DisConcierge represents the main application struct for the DisConcierge bot.
 // It encapsulates all the core components and configurations necessary
@@ -94,10 +114,6 @@ var (
 // command processing, API interactions, database operations, and integration with
 // external services like Discord and OpenAI.
 type DisConcierge struct {
-	// pgNotifyID is a random ID generated at startup. When using postgres,
-	// this is used as the NOTIFY payload, so the bot can determine when
-	// it's receiving a message from itself (and ignore it).
-
 	dbNotifier DBNotifier
 	config     *Config
 
@@ -175,14 +191,6 @@ type DisConcierge struct {
 	// protecc the map
 	userWorkerMu sync.RWMutex
 
-	// Indicates whether admin credentials have been set.
-	// If they haven't, Run will hold just after the init
-	// process is done and API has started, prior to starting
-	// any other processes - this ensures the bot doesn't enqueue
-	// responding to commands before the bot can be configured/stopped
-	// via UI.
-	pendingSetup atomic.Bool
-
 	// getInteractionHandlerFunc should be a callable to be used
 	// when an interaction is received, which returns an appropriate
 	// InteractionHandler. This enables command execution to remain the
@@ -219,235 +227,6 @@ type DisConcierge struct {
 	triggerRuntimeConfigRefreshCh chan bool
 	triggerUserCacheRefreshCh     chan bool
 	triggerUserUpdatedRefreshCh   chan string
-}
-
-func (d *DisConcierge) getLogger(ctx context.Context) (
-	context.Context,
-	*slog.Logger,
-) {
-	logger, ok := ContextLogger(ctx)
-	if logger == nil || !ok {
-		logger = d.logger
-		ctx = WithLogger(ctx, logger)
-	}
-	return ctx, logger
-}
-
-// handleDiscordMessage processes incoming Discord messages that mention the
-// bot or are in response to a bot interaction.
-//
-// This method is typically called as a goroutine for each new message
-// received through the Discord gateway.
-// It filters and handles messages that are relevant to the bot, such as direct
-// mentions or replies to bot messages.
-//
-// Messages which are replies to a known bot interaction are
-// saved as a DiscordMessage.
-//
-// If the message is a reply to a known bot interaction, or mentions the
-// bot, it's saved as DiscordMessage.
-//
-// If the message is a reply to a known bot interaction, and the associated
-// [ChatCommand.DiscordMessageID] is empty, it will be set to the referenced
-// interaction message ID.
-//
-// If the message isn't a reply to a bot interaction, and mentions ONLY
-// the bot, the bot will reply with a greeting message and example slash
-// command usage.
-// This greeting message is only sent if the user doesn't have [User.Ignored]
-// set, and if the user doesn't already have a [userCommandWorker] running.
-// [userCommandWorker] will only reply to the first message it receives
-// while it's running, so at minimum once every two minutes (this is to
-// prevent spamming @mentions at the bot).
-func (d *DisConcierge) handleDiscordMessage(
-	ctx context.Context,
-	m *discordgo.MessageCreate,
-) {
-	ctx, logger := d.getLogger(ctx)
-
-	logger.DebugContext(ctx, "saw message", "message", structToSlogValue(m))
-
-	if m.MentionEveryone {
-		logger.DebugContext(
-			ctx,
-			"ignoring message mentioning everyone",
-			"message",
-			structToSlogValue(m),
-		)
-		return
-	}
-
-	if len(m.Mentions) == 0 && m.ReferencedMessage == nil {
-		logger.DebugContext(
-			ctx,
-			"ignoring message with no mentions or interaction",
-			"message",
-			structToSlogValue(m),
-		)
-		return
-	}
-
-	user := m.Author
-	if user == nil && m.Member != nil {
-		user = m.Member.User
-	}
-	if user == nil {
-		logger.WarnContext(ctx, "couldn't find user in discord message")
-		return
-	}
-
-	if user.Bot || user.ID == d.config.Discord.ApplicationID {
-		logger.DebugContext(ctx, "ignoring message from bot", "user", user)
-		return
-	}
-
-	dm := NewDiscordMessage(m.Message)
-
-	mentionsBot := messageMentionsUser(
-		m.Message,
-		d.config.Discord.ApplicationID,
-	)
-
-	// if the bot isn't mentioned, and this isn't a reply to one of the bot's
-	// own interactions, we ignore the message entirely
-	if dm.InteractionID == "" && !mentionsBot {
-		logger.Debug("no interaction, no mentions, ignoring")
-		return
-	}
-
-	// that leaves us with these possibilities, where we save the message for each:
-	// - the reply is to a known bot interaction (we don't respond)
-	// - the message mentions the bot and others (we don't respond)
-	// - the message mentions ONLY the bot  (we potentially respond)
-	//
-	// If we 'potentially' respond, we enqueue the user worker and send the
-	// message to replyCh. The worker tracks whether it's received a message
-	// on that channel before. If it has, it ignores the message.
-	// This means the bot will respond in this way to a user at most
-	// once for the lifetime of the worker, so a minimum of 2 minutes.
-	// This prevents a user from spamming @mentions at the bot and hitting
-	// Discord rate limits.
-
-	wg := &sync.WaitGroup{}
-	defer wg.Wait()
-
-	defer func() {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if _, err := d.writeDB.Create(&dm); err != nil {
-				logger.ErrorContext(
-					ctx,
-					"error creating discord message log",
-					tint.Err(err), "discord_message",
-					dm,
-				)
-			} else {
-				logger.InfoContext(
-					ctx,
-					"created new discord_message mentioning bot",
-					"discord_message",
-					dm,
-				)
-			}
-		}()
-	}()
-
-	switch {
-	case dm.InteractionID == "" && mentionsBot:
-		mentionCount := len(m.Mentions)
-		if mentionCount != 1 {
-			logger.InfoContext(
-				ctx,
-				"multiple mentions, will not respond to message",
-			)
-			return
-		}
-		u, _, err := d.GetOrCreateUser(ctx, *user)
-		if err != nil {
-			logger.ErrorContext(ctx, "error getting or creating user", tint.Err(err))
-			return
-		}
-		if u.Ignored {
-			logger.WarnContext(
-				ctx,
-				"ignoring direct message from ignored user",
-				"user", u,
-			)
-			return
-		}
-	case dm.InteractionID != "":
-		chatCommand := ChatCommand{}
-
-		err := d.db.Select("id", columnChatCommandInteractionID).Take(
-			&chatCommand,
-			"interaction_id = ?",
-			dm.InteractionID,
-		).Error
-		if err != nil {
-			switch {
-			case errors.Is(err, gorm.ErrRecordNotFound):
-				logger.InfoContext(
-					ctx,
-					"no ChatCommand found for interaction",
-					"interaction_id",
-					dm.InteractionID,
-				)
-			default:
-				logger.ErrorContext(ctx, "error finding chat command", tint.Err(err))
-			}
-			return
-		}
-
-		logger.DebugContext(
-			ctx,
-			fmt.Sprintf(
-				"chat_command.interaction_id=%#v discord_message.interaction_id=%#v",
-				chatCommand.InteractionID,
-				dm.InteractionID,
-			),
-		)
-		if chatCommand.InteractionID != dm.InteractionID {
-			logger.WarnContext(
-				ctx,
-				fmt.Sprintf(
-					"why do these not match: %s / %s",
-					chatCommand.InteractionID,
-					dm.InteractionID,
-				),
-			)
-			return
-		}
-		logger.InfoContext(
-			ctx,
-			"found matching message",
-			"discord_message",
-			dm,
-		)
-		if chatCommand.DiscordMessageID == "" {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				if _, updErr := d.writeDB.Update(
-					&chatCommand,
-					columnChatCommandDiscordMessageID,
-					dm.ReferencedMessageID,
-				); updErr != nil {
-					logger.Error(
-						"error updating chat_command with new discord_message_id",
-						tint.Err(updErr),
-					)
-				}
-			}()
-		}
-	}
-}
-
-// RuntimeConfig returns a copy of the current runtime configuration
-func (d *DisConcierge) RuntimeConfig() RuntimeConfig {
-	d.cfgMu.RLock()
-	defer d.cfgMu.RUnlock()
-	return *d.runtimeConfig
 }
 
 // New creates and initializes a new DisConcierge instance.
@@ -531,6 +310,7 @@ func New(config *Config) (*DisConcierge, error) {
 	disc, err := newDiscord(d.config.Discord)
 	if err != nil {
 		errs = append(errs, err)
+		return nil, errors.Join(errs...)
 	}
 
 	discordgo.Logger = discordgoLoggerFunc(
@@ -555,7 +335,7 @@ func New(config *Config) (*DisConcierge, error) {
 	d.discord = disc
 	disc.dc = d
 
-	d.requestQueue = NewChatCommandQueue(
+	d.requestQueue = NewChatCommandMemoryQueue(
 		d.config.Queue,
 		d.logger.With(loggerNameKey, "queue"),
 	)
@@ -571,6 +351,193 @@ func New(config *Config) (*DisConcierge, error) {
 	}
 
 	return d, errors.Join(errs...)
+}
+
+// Run starts the main loop of the DisConcierge bot.
+//
+// This function initializes the bot's runtime environment, validates the configuration,
+// and starts the primary application functions, including broadcasting events to
+// websocket subscribers and monitoring/handling the ChatCommand queue.
+//
+// Parameters:
+//   - ctx: The context for managing the lifecycle of the bot's runtime.
+//
+// Returns:
+//   - error: An error if any part of the runtime initialization or execution fails.
+func (d *DisConcierge) Run(parentCtx context.Context) error {
+	// prevents concurrent runs
+	d.runMu.Lock()
+	defer d.runMu.Unlock()
+
+	d.signalStop = make(chan struct{}, 1)
+
+	d.startedAt = time.Now()
+	logger := d.logger
+
+	if err := d.ValidateConfig(); err != nil {
+		logger.Error("invalid config", tint.Err(err))
+		return err
+	}
+
+	notifier, err := newDBNotifier(d)
+	if err != nil {
+		logger.Error("error creating db notifier", tint.Err(err))
+		return err
+	}
+	d.dbNotifier = notifier
+
+	parentCtx = WithLogger(parentCtx, logger)
+
+	// this is the 'runtime' context, which triggers a graceful shutdown
+	// when canceled
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+
+	d.webhookInteractionHandler = webhookReceiveHandler(ctx, d)
+
+	logger.LogAttrs(ctx, slog.LevelInfo, "starting", slog.Any("config", d.config))
+	if d.signalReady == nil {
+		d.signalReady = make(chan struct{}, 1)
+	}
+
+	go func() {
+		select {
+		case <-parentCtx.Done():
+			d.logger.Warn("parent context canceled, canceling runtime context")
+			cancel(NewShutdownError("received shutdown signal"))
+		case <-d.signalStop:
+			d.logger.Warn("got stop signal, canceling")
+			cancel(NewShutdownError("received shutdown signal"))
+		case <-ctx.Done():
+			d.logger.Warn("context canceled, sending stop signal")
+			d.signalStop <- struct{}{}
+			return
+		}
+	}()
+
+	go func() {
+		httpErr := d.api.Serve(ctx)
+		if httpErr != nil && !errors.Is(httpErr, http.ErrServerClosed) {
+			d.logger.ErrorContext(ctx, "error serving api HTTP", tint.Err(httpErr))
+		}
+	}()
+
+	startCtx, startCancel := context.WithTimeout(ctx, d.config.StartupTimeout)
+	defer startCancel()
+
+	initErr := make(chan error, 1)
+	go func() {
+		logger.Debug("initializing run...")
+		initErr <- d.initRun(startCtx, ctx)
+	}()
+
+	select {
+	case <-startCtx.Done():
+		return fmt.Errorf("startup cancelled or timed out")
+	case e := <-initErr:
+		if e != nil {
+			logger.ErrorContext(ctx, "init error", tint.Err(e))
+			_ = d.api.httpServer.Close()
+			if d.discordWebhookServer != nil {
+				_ = d.discordWebhookServer.httpServer.Close()
+			}
+			return e
+		} else {
+			logger.WarnContext(ctx, "init complete")
+		}
+	}
+
+	// primary application functions - broadcasting events to
+	// websocket subscribers, and monitoring/handling the ChatCommand queue
+	runtimeWG := &sync.WaitGroup{}
+
+	if d.openai.requestLimiter == nil {
+		d.openai.requestLimiter = rate.NewLimiter(
+			rate.Limit(d.RuntimeConfig().OpenAIMaxRequestsPerSecond),
+			1,
+		)
+	}
+
+	runtimeWG.Add(1)
+	go func() {
+		defer runtimeWG.Done()
+		d.catchupAndWatchQueue(ctx, logger)
+	}()
+
+	runtimeWG.Add(1)
+	go func() {
+		defer runtimeWG.Done()
+		_ = d.populateExpiredInteractionRunStatus(
+			ctx,
+			30*time.Second,
+			2*time.Minute,
+			2,
+		)
+	}()
+
+	runtimeCfg := d.RuntimeConfig()
+
+	if d.config.Discord.WebhookServer.Enabled {
+		d.startWebhookServer(ctx, runtimeWG)
+	} else if !runtimeCfg.DiscordGatewayEnabled {
+		logger.WarnContext(ctx, "discord gateway and webhook server disabled")
+	}
+
+	if discErr := d.initDiscordSession(ctx, runtimeWG); discErr != nil {
+		d.logger.ErrorContext(ctx, "error creating discord session", tint.Err(discErr))
+		return discErr
+	}
+
+	d.startRuntimeConfigRefresher(ctx, runtimeWG, logger)
+	d.startUserCacheRefresher(ctx, runtimeWG)
+	d.startUserUpdatedListener(ctx, runtimeWG)
+	d.startDBNotifiers(ctx, runtimeWG)
+
+	if e := d.discordInit(ctx, runtimeCfg, logger); e != nil {
+		return e
+	}
+
+	d.signalReady <- struct{}{}
+	d.logger.InfoContext(ctx, "sent ready signal")
+
+	// block until something cancels the main runtime context - generally
+	// from an interrupt, or the `/api/quit` endpoint
+	stopCh := make(chan struct{}, 1)
+	go func() {
+		<-ctx.Done()
+		stopCh <- struct{}{}
+	}()
+	<-stopCh
+
+	shutdownCtx, shutdownCancel := d.shutdownContext()
+	defer shutdownCancel()
+	deadline, _ := shutdownCtx.Deadline()
+	d.logger.InfoContext(
+		ctx,
+		"exiting!",
+		"shutdown_timeout", d.config.ShutdownTimeout,
+		"shutdown_deadline", deadline,
+	)
+
+	runtimeFinished := make(chan struct{}, 1)
+	go func() {
+		runtimeWG.Wait()
+		runtimeFinished <- struct{}{}
+	}()
+	select {
+	case <-runtimeFinished:
+		return d.shutdown(shutdownCtx)
+	case <-shutdownCtx.Done():
+		d.logger.Warn("timed out waiting for runtime processes")
+		return shutdownCtx.Err()
+	}
+}
+
+// RuntimeConfig returns a copy of the current runtime configuration
+func (d *DisConcierge) RuntimeConfig() RuntimeConfig {
+	d.cfgMu.RLock()
+	defer d.cfgMu.RUnlock()
+	return *d.runtimeConfig
 }
 
 func (d *DisConcierge) ValidateConfig() error {
@@ -591,6 +558,395 @@ func (d *DisConcierge) RegisterSlashCommands(options ...discordgo.RequestOption)
 	error,
 ) {
 	return d.discord.registerCommands(d.RuntimeConfig(), options...)
+}
+
+// Pause 'pauses' the bot. While paused, ChatCommand nor ClearCommand
+// will be queued or executed - unless User.Priority is set. In that case,
+// that user's incoming ChatCommand will be queued, though not executed
+// until the bot is resumed.
+func (d *DisConcierge) Pause(ctx context.Context) bool {
+	prev := d.paused.Swap(true)
+	if prev {
+		return false
+	}
+
+	if err := d.discord.updateStatusComplex(
+		discordgo.UpdateStatusData{
+			AFK:    true,
+			Status: string(discordgo.StatusDoNotDisturb),
+		},
+	); err != nil {
+		d.logger.ErrorContext(ctx, "unable to update afk status", tint.Err(err))
+	}
+	if !d.runtimeConfig.Paused {
+		if _, err := d.writeDB.Update(
+			context.TODO(),
+			d.runtimeConfig,
+			"paused",
+			true,
+		); err != nil {
+			d.logger.ErrorContext(ctx, "unable to set paused in db", tint.Err(err))
+		}
+	}
+	return true
+}
+
+// Resume resumes command processing. It returns a bool indicating whether
+// the bot was paused at the time the function was called.
+func (d *DisConcierge) Resume(ctx context.Context) bool {
+	prev := d.paused.Swap(false)
+	if !prev {
+		d.logger.Warn("bot not paused")
+		return false
+	}
+	d.logger.InfoContext(ctx, "bot resumed")
+
+	if err := d.discord.updateCustomStatus(d.runtimeConfig.DiscordCustomStatus); err != nil {
+		d.logger.ErrorContext(ctx, "unable to update noline status", tint.Err(err))
+	}
+
+	if d.runtimeConfig.Paused {
+		if _, err := d.writeDB.Update(
+			context.TODO(),
+			d.runtimeConfig,
+			columnRuntimeConfigPaused,
+			false,
+		); err != nil {
+			d.logger.ErrorContext(ctx, "unable to set resumed in db", tint.Err(err))
+		}
+	}
+
+	return true
+}
+
+// handleInteraction processes incoming Discord interactions for the DisConcierge bot.
+//
+// This function is responsible for handling various types of Discord interactions,
+// including application commands (slash commands), message components, and modal submits.
+// It manages the flow of interaction processing, from initial reception to final response.
+//
+// Parameters:
+//   - ctx: A context.Context for managing the lifecycle of the interaction handling.
+//   - handler: An InteractionHandler interface that provides methods for
+//     responding to the interaction.
+//
+// The function performs the following main tasks:
+//  1. Logs the incoming interaction details.
+//  2. Creates an InteractionLog record in the database.
+//  3. Handles different interaction types:
+//     - InteractionPing: Responds with a pong.
+//     - InteractionModalSubmit: Processes modal submissions (e.g., feedback forms).
+//     - InteractionMessageComponent: Handles button clicks and other component interactions.
+//     - InteractionApplicationCommand: Processes slash commands like /chat, /private, /clear, etc.
+//  4. For application commands, it:
+//     - Acknowledges the interaction if necessary.
+//     - Retrieves or creates a User record associated with the interaction.
+//     - Processes specific commands (/chat, /private, /clear).
+//     - Manages command queuing and execution.
+//  5. Handles errors and updates interaction states accordingly.
+//
+// The function uses goroutines for concurrent processing of certain tasks,
+// such as database operations and long-running command executions.
+//
+// Note: This function is central to the bot's operation and integrates various
+// components like user management, command processing, and Discord API interactions.
+func (d *DisConcierge) handleInteraction(
+	ctx context.Context,
+	handler InteractionHandler,
+) {
+	interaction := handler.GetInteraction()
+	logger := handler.Logger()
+
+	i := handler.GetInteraction()
+	discordUser := getDiscordUser(i)
+	if discordUser == nil {
+		logger.ErrorContext(
+			ctx,
+			"no user found in interaction",
+			"interaction", structToSlogValue(i),
+		)
+		return
+	}
+
+	logger = logger.With(slog.Group("interaction", interactionLogAttrs(*i)...))
+	ctx = WithLogger(ctx, logger)
+	logger.InfoContext(ctx, "received new interaction", "user", structToSlogValue(discordUser))
+
+	interactionLog, err := newInteractionLog(i, discordUser, handler)
+	if err != nil {
+		logger.ErrorContext(ctx, "error marshaling interaction", tint.Err(err))
+	}
+
+	wg := &sync.WaitGroup{}
+	defer wg.Wait()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if _, createErr := d.writeDB.Create(context.TODO(), interactionLog); createErr != nil {
+			logger.ErrorContext(ctx, "error logging interaction", tint.Err(createErr))
+		}
+	}()
+
+	if discordUser.Bot {
+		logger.WarnContext(ctx, "user is bot, ignoring", "user", discordUser)
+		return
+	}
+
+	switch interaction.Type {
+	case discordgo.InteractionPing:
+		_ = handler.Respond(
+			ctx, &discordgo.InteractionResponse{
+				Type: discordgo.InteractionResponsePong,
+			},
+		)
+	case discordgo.InteractionModalSubmit:
+		if modalErr := d.interactionResponseToSubmittedModal(ctx, i, handler); modalErr != nil {
+			logger.Error("error with modal response", tint.Err(modalErr))
+		}
+	case discordgo.InteractionMessageComponent:
+		e := d.interactionResponseToMessageComponent(ctx, i, handler)
+		if e != nil {
+			logger.ErrorContext(ctx, "error with component response", tint.Err(e))
+		}
+	case discordgo.InteractionApplicationCommand:
+		commandName := i.ApplicationCommandData().Name
+
+		ackCtx, ackCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer ackCancel()
+		ackCtx = WithLogger(ackCtx, logger)
+
+		u, _, e := d.GetOrCreateUser(ackCtx, *discordUser)
+
+		if e != nil {
+			logger.ErrorContext(ackCtx, "error getting user", tint.Err(e))
+			return
+		}
+
+		logger = logger.With(slog.Group("user", userLogAttrs(*u)...))
+
+		// ignore any interactions from ignored users, or from
+		// non-priority users while the bot is paused
+		if u.Ignored || (d.paused.Load() && !u.Priority) {
+			d.handleIgnoredUserCommand(ctx, handler, u, i)
+			return
+		}
+
+		switch commandName {
+		case DiscordSlashCommandChat, DiscordSlashCommandPrivate:
+			ackErr := handler.Respond(
+				ackCtx,
+				d.discord.ackResponse(commandName),
+			)
+			if ackErr != nil {
+				logger.ErrorContext(ackCtx, "error acknowledging interaction", tint.Err(ackErr))
+			}
+
+			chatCommand, cmdErr := NewChatCommand(u, i)
+			if cmdErr != nil {
+				logger.ErrorContext(ctx, "error creating chat_command", tint.Err(cmdErr))
+				return
+			}
+
+			if i.ApplicationCommandData().Name == DiscordSlashCommandPrivate {
+				chatCommand.Private = true
+			}
+			chatCommand.handler = handler
+
+			if ackErr != nil {
+				// abort any command that can't be acknowledged in time.
+				// since it's not acked, we can't respond with an error message,
+				// so just save the record and return
+				chatCommand.Error = NullableString(ackErr.Error())
+				chatCommand.State = ChatCommandStateAborted
+				if _, createErr := d.writeDB.Create(
+					context.TODO(),
+					chatCommand,
+				); createErr != nil {
+					logger.Error("error saving chat command", tint.Err(createErr))
+				}
+				return
+			}
+
+			chatCommand.Acknowledged = true
+
+			followupCtx, followupCancel := context.WithTimeout(
+				context.Background(),
+				d.config.Queue.MaxAge,
+			)
+			defer followupCancel()
+
+			if _, createErr := d.writeDB.Create(followupCtx, chatCommand); createErr != nil {
+				chatCommand.finalizeWithError(ctx, d, createErr)
+				return
+			}
+
+			msg, respErr := handler.GetResponse(followupCtx)
+			if respErr != nil {
+				chatCommand.Acknowledged = false
+				logger.Error("error getting interaction response", tint.Err(respErr))
+				chatCommand.finalizeWithError(ctx, d, respErr)
+				return
+			}
+
+			if chatCommand.DiscordMessageID == "" && msg != nil {
+				chatCommand.DiscordMessageID = msg.ID
+			}
+
+			if _, updErr := d.writeDB.Updates(
+				followupCtx, chatCommand, map[string]any{
+					columnChatCommandDiscordMessageID: chatCommand.DiscordMessageID,
+				},
+			); updErr != nil {
+				logger.ErrorContext(ctx, "error updating chat_command", tint.Err(updErr))
+				chatCommand.finalizeWithError(followupCtx, d, updErr)
+				return
+			}
+
+			logger = logger.With(
+				slog.Group("chat_command", chatCommandLogAttrs(*chatCommand)...),
+			)
+			ctx = WithLogger(ctx, logger)
+
+			chatCommand.enqueue(ctx, d)
+		case DiscordSlashCommandClear:
+			clearRec := NewUserClearCommand(d, u, i)
+			clearRec.handler = handler
+			ackErr := handler.Respond(ackCtx, d.discord.ackResponse(commandName))
+			if ackErr != nil {
+				logger.ErrorContext(ctx, "error acknowledging interaction", tint.Err(ackErr))
+				clearRec.State = ClearCommandStateFailed
+				if _, dbErr := d.writeDB.Create(context.TODO(), clearRec); dbErr != nil {
+					logger.Error("error saving clear command", tint.Err(dbErr))
+				}
+				return
+			}
+			clearRec.Acknowledged = true
+			d.runClearCommand(ctx, handler, clearRec)
+		}
+	}
+}
+
+func (d *DisConcierge) shutdownAPIServer(ctx context.Context) error {
+	d.logger.InfoContext(ctx, "stopping http server")
+	err := d.api.httpServer.Shutdown(ctx)
+	d.logger.InfoContext(ctx, "http server stopped")
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			d.logger.Warn("shutdown timeout exceeded, closing all api connections")
+			return d.api.httpServer.Close()
+		} else if !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("error shutting down webhook server: %w", err)
+		}
+	}
+	d.logger.InfoContext(ctx, "api server stopped")
+	return nil
+}
+
+func (d *DisConcierge) shutdownWebhookServer(ctx context.Context) error {
+	d.logger.InfoContext(ctx, "stopping webhook http server")
+	err := d.discordWebhookServer.httpServer.Shutdown(ctx)
+
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			d.logger.Warn("shutdown timeout exceeded, closing all webhook connections")
+			return d.discordWebhookServer.httpServer.Close()
+		} else if !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("error shutting down webhook server: %w", err)
+		}
+	}
+	d.logger.InfoContext(ctx, "webhook http server stopped")
+	return nil
+}
+
+// shutdownDiscordSession closes the discord gateway connection and removes
+// all registered discord event handlers.
+func (d *DisConcierge) shutdownDiscordSession(ctx context.Context) error {
+	if d.discord.session == nil {
+		return nil
+	}
+	d.logger.InfoContext(ctx, "closing discord session")
+	errs := make([]error, 0, 2)
+	errs = append(errs, d.discord.session.Close())
+	d.logger.InfoContext(ctx, "discord session closed")
+	if len(d.discord.discordgoRemoveHandlerFuncs) > 0 {
+		d.logger.InfoContext(
+			ctx,
+			fmt.Sprintf(
+				"removing %d discord handlers",
+				len(d.discord.discordgoRemoveHandlerFuncs),
+			),
+		)
+		for _, h := range d.discord.discordgoRemoveHandlerFuncs {
+			if ctx.Err() != nil {
+				errs = append(errs, ctx.Err())
+				break
+			}
+			h()
+		}
+		d.logger.InfoContext(ctx, "finished removing handlers")
+	}
+	return errors.Join(errs...)
+}
+
+// stopUserWorkers sends a shutdown signal to each userCommandWorker, and
+// for each, waits on the return signal
+func (d *DisConcierge) stopUserWorkers(ctx context.Context) error {
+	d.userWorkerMu.Lock()
+	defer d.userWorkerMu.Unlock()
+
+	g := new(errgroup.Group)
+
+	for wid, worker := range d.userWorkers {
+		g.Go(
+			func() error {
+				d.logger.Info("sending stop signal to worker", "worker", worker)
+				select {
+				case worker.signalStop <- struct{}{}:
+					d.logger.Info("sent stop signal, waiting on confirmation", "worker", worker)
+				case <-ctx.Done():
+					d.logger.Info("graceful shutdown cancelled, aborting", "worker", worker)
+					return fmt.Errorf("worker %q shutdown timed out: %w", wid, ctx.Err())
+				}
+
+				select {
+				case <-worker.stopped:
+					d.logger.Info("worker stopped", "worker", worker)
+				case <-ctx.Done():
+					d.logger.Info("graceful shutdown cancelled, aborting", "worker", worker)
+					return fmt.Errorf("worker %q shutdown timed out: %w", wid, ctx.Err())
+				}
+				return nil
+			},
+		)
+	}
+
+	err := g.Wait()
+	d.userWorkers = map[string]*userCommandWorker{}
+	return err
+}
+
+// flushRequestQueue clears the request queue and logs the number of
+// requests purged
+func (d *DisConcierge) flushRequestQueue(ctx context.Context) error {
+	queueFlushCt := 0
+	for ctx.Err() == nil && d.requestQueue.Len() > 0 {
+		rq := d.requestQueue.Clear(ctx)
+		if rq != nil {
+			queueFlushCt++
+		} else {
+			break
+		}
+	}
+	d.logger.InfoContext(
+		ctx,
+		"purged request queue",
+		"count", queueFlushCt,
+	)
+	if ctx.Err() != nil {
+		return fmt.Errorf("request queue flush interrupted: %w", ctx.Err())
+	}
+	return nil
 }
 
 // getUserWorker retrieves or creates a user command worker for the given user.
@@ -625,6 +981,8 @@ func (d *DisConcierge) getUserWorker(
 		d.userWorkersRunning.Add(1)
 		defer d.userWorkersRunning.Add(-1)
 
+		// run the worker - when the function exits (worker stopped),
+		// we can delete it from the map
 		userWorker.Run(ctx, startSignal)
 
 		d.userWorkerMu.Lock()
@@ -632,6 +990,8 @@ func (d *DisConcierge) getUserWorker(
 
 		w, ok := d.userWorkers[u.ID]
 		if ok && w == userWorker {
+			// only delete if it's actually the same struct, on the off chance
+			// that another worker for the same user has been created in the meantime
 			delete(d.userWorkers, u.ID)
 		}
 	}()
@@ -639,6 +999,33 @@ func (d *DisConcierge) getUserWorker(
 	d.userWorkers[u.ID] = userWorker
 	<-startSignal
 	return userWorker
+}
+
+func (d *DisConcierge) startDBNotifiers(ctx context.Context, runtimeWG *sync.WaitGroup) {
+	runtimeWG.Add(1)
+	go func() {
+		defer runtimeWG.Done()
+		if e := d.dbNotifier.Listen(ctx, d.dbNotifier.RuntimeConfigChannelName()); e != nil {
+			d.logger.ErrorContext(ctx, "error listening to runtime config channel", tint.Err(e))
+		}
+	}()
+
+	runtimeWG.Add(1)
+	go func() {
+		defer runtimeWG.Done()
+		if e := d.dbNotifier.Listen(ctx, d.dbNotifier.UserCacheChannelName()); e != nil {
+			d.logger.ErrorContext(ctx, "error listening to user cache channel", tint.Err(e))
+		}
+	}()
+
+	runtimeWG.Add(1)
+	go func() {
+		defer runtimeWG.Done()
+		if e := d.dbNotifier.Listen(ctx, d.dbNotifier.UserUpdateChannelName()); e != nil {
+			d.logger.ErrorContext(ctx, "error listening to user update channel", tint.Err(e))
+		}
+	}()
+
 }
 
 // catchupInterruptedRuns looks for ChatCommand records that have been
@@ -657,23 +1044,23 @@ func (d *DisConcierge) catchupInterruptedRuns(ctx context.Context) error {
 	}
 	rv := d.db.WithContext(ctx).Order("priority desc, created_at asc").Find(
 		&inProgress,
-		"state IN ? OR run_status IN ? OR step = ?",
+		"(state IN ? OR run_status IN ?) "+
+			"AND token_expires is not null "+
+			"AND token_expires >= ?",
 		[]string{
 			ChatCommandStateReceived.String(),
 			ChatCommandStateInProgress.String(),
 			ChatCommandStateQueued.String(),
-		}, []string{
+		},
+		[]string{
 			string(openai.RunStatusInProgress),
 			string(openai.RunStatusQueued),
-		}, ChatCommandStepFeedbackOpen,
+		},
+		time.Now().UnixMilli(),
 	)
 
 	if rv.Error != nil {
-		logger.ErrorContext(
-			ctx,
-			"error performing catchup query",
-			tint.Err(rv.Error),
-		)
+		logger.ErrorContext(ctx, "error performing catchup query", tint.Err(rv.Error))
 		return rv.Error
 	}
 
@@ -708,255 +1095,17 @@ func (d *DisConcierge) catchupInterruptedRuns(ctx context.Context) error {
 	return nil
 }
 
-func newDBNotifier(d *DisConcierge) (DBNotifier, error) {
-	notifyID, err := generateRandomHexString(16)
-	if err != nil {
-		return nil, err
-	}
-	log := d.logger.With(loggerNameKey, "db_notifier")
-	var notifier DBNotifier
-	switch d.config.DatabaseType {
-	case dbTypeSQLite:
-		notifier = &sqliteNotifier{
-			logger:         log,
-			d:              d,
-			sqliteNotifyID: notifyID,
-		}
-	case dbTypePostgres:
-		notifier = &postgresNotifier{
-			d:          d,
-			logger:     log,
-			pgNotifyID: notifyID,
-		}
-	default:
-		return nil, errors.New("invalid database type")
-	}
-	return notifier, nil
-}
-
-// Run starts the main loop of the DisConcierge bot.
-//
-// This function initializes the bot's runtime environment, validates the configuration,
-// and starts the primary application functions, including broadcasting events to
-// websocket subscribers and monitoring/handling the ChatCommand queue.
-//
-// Parameters:
-//   - ctx: The context for managing the lifecycle of the bot's runtime.
-//
-// Returns:
-//   - error: An error if any part of the runtime initialization or execution fails.
-func (d *DisConcierge) Run(ctx context.Context) error {
-	// prevents concurrent runs
-	d.runMu.Lock()
-	defer d.runMu.Unlock()
-
-	d.signalStop = make(chan struct{}, 1)
-
-	d.startedAt = time.Now()
-	logger := d.logger
-
-	if err := d.ValidateConfig(); err != nil {
-		logger.Error("invalid config", tint.Err(err))
-		return err
-	}
-
-	notifier, err := newDBNotifier(d)
-	if err != nil {
-		logger.Error("error creating db notifier", tint.Err(err))
-		return err
-	}
-	d.dbNotifier = notifier
-
-	ctx = WithLogger(ctx, logger)
-
-	// primary application functions - broadcasting events to
-	// websocket subscribers, and monitoring/handling the ChatCommand queue
-	runtimeWG := &sync.WaitGroup{}
-
-	d.webhookInteractionHandler = webhookReceiveHandler(ctx, d)
-
-	logger.LogAttrs(ctx, slog.LevelInfo, "starting", slog.Any("config", d.config))
-	if d.signalReady == nil {
-		d.signalReady = make(chan struct{}, 1)
-	}
-
-	// this is the 'runtime' context, which triggers a graceful shutdown
-	// when canceled
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	go func() {
-		select {
-		case <-d.signalStop:
-			d.logger.Warn("got stop signal, canceling")
-			cancel()
-		case <-ctx.Done():
-			d.logger.Warn("context canceled, sending stop signal")
-			d.signalStop <- struct{}{}
-			return
-		}
-	}()
-
-	go func() {
-		httpErr := d.api.Serve(ctx)
-		if httpErr != nil && !errors.Is(httpErr, http.ErrServerClosed) {
-			d.logger.ErrorContext(ctx, "error serving api HTTP", tint.Err(httpErr))
-		}
-	}()
-
-	startCtx, startCancel := context.WithTimeout(ctx, d.config.StartupTimeout)
-	defer startCancel()
-
-	initErr := make(chan error, 1)
-	go func() {
-		logger.Debug("initializing run...")
-		initErr <- d.initRun(startCtx, ctx)
-	}()
-
-	select {
-	case <-startCtx.Done():
-		return fmt.Errorf("startup cancelled or timed out")
-	case err := <-initErr:
-		if err != nil {
-			logger.ErrorContext(ctx, "init error", tint.Err(err))
-			if d.api != nil && d.api.listener != nil {
-				go func() {
-					if e := d.api.listener.Close(); e != nil {
-						logger.ErrorContext(ctx, "error closing listener", tint.Err(e))
-					}
-				}()
-			}
-			return err
-		} else {
-			logger.WarnContext(ctx, "init complete")
-		}
-	}
-
-	if setupErr := d.waitOnSetup(ctx, logger, runtimeWG); setupErr != nil {
-		return setupErr
-	}
-
-	if d.openai.requestLimiter == nil {
-		d.openai.requestLimiter = rate.NewLimiter(
-			rate.Limit(d.RuntimeConfig().OpenAIMaxRequestsPerSecond),
-			1,
-		)
-	}
-
-	runtimeWG.Add(1)
-	go func() {
-		defer runtimeWG.Done()
-		d.catchupAndWatchQueue(ctx, logger)
-	}()
-
-	runtimeCfg := d.RuntimeConfig()
-
-	if d.config.Discord.WebhookServer.Enabled {
-		d.startWebhookServer(ctx, runtimeWG)
-	} else if !runtimeCfg.DiscordGatewayEnabled {
-		logger.WarnContext(ctx, "discord gateway and webhook server disabled")
-	}
-
-	if discErr := d.initDiscordSession(ctx, runtimeWG); discErr != nil {
-		d.logger.ErrorContext(ctx, "error creating discord session", tint.Err(discErr))
-		return discErr
-	}
-
-	if err := d.discordInit(ctx, runtimeCfg, logger); err != nil {
-		return err
-	}
-
-	d.startRuntimeConfigRefresher(ctx, runtimeWG, logger)
-	d.startUserCacheRefresher(ctx, runtimeWG)
-	d.startUserUpdatedListener(ctx, runtimeWG)
-
-	d.signalReady <- struct{}{}
-	d.logger.InfoContext(ctx, "sent ready signal")
-
-	runtimeWG.Add(1)
-	go func() {
-		defer runtimeWG.Done()
-		if e := d.dbNotifier.Listen(ctx, d.dbNotifier.RuntimeConfigChannelName()); e != nil {
-			d.logger.ErrorContext(ctx, "error listening to runtime config channel", tint.Err(e))
-		}
-	}()
-
-	runtimeWG.Add(1)
-	go func() {
-		defer runtimeWG.Done()
-		if e := d.dbNotifier.Listen(ctx, d.dbNotifier.UserCacheChannelName()); e != nil {
-			d.logger.ErrorContext(ctx, "error listening to user cache channel", tint.Err(e))
-		}
-	}()
-
-	runtimeWG.Add(1)
-	go func() {
-		defer runtimeWG.Done()
-		if e := d.dbNotifier.Listen(ctx, d.dbNotifier.UserUpdateChannelName()); e != nil {
-			d.logger.ErrorContext(ctx, "error listening to user update channel", tint.Err(e))
-		}
-	}()
-
-	// block until something cancels the main runtime context - generally
-	// from an interrupt, or the `/api/quit` endpoint
-	stopCh := make(chan struct{}, 1)
-	go func() {
-		<-ctx.Done()
-		stopCh <- struct{}{}
-	}()
-	<-stopCh
-
-	// Commence shutdown
-	return d.shutdown(ctx, runtimeWG)
-}
-
-func (d *DisConcierge) waitOnSetup(
-	ctx context.Context,
-	logger *slog.Logger,
-	runtimeWG *sync.WaitGroup,
-) error {
-	if !d.pendingSetup.Load() {
-		return nil
-	}
-
-	logger.WarnContext(
-		ctx,
-		fmt.Sprintf(
-			"pending initial setup at: %s%s",
-			d.api.listener.Addr().String(),
-			apiAdminSetup,
-		),
+// shutdownContext returns a context with a deadline of the current time,
+// plus the configured shutdown timeout. This is used to set a limit on
+// how long the graceful shutdown process can take.
+func (d *DisConcierge) shutdownContext() (context.Context, context.CancelFunc) {
+	shutdownStart := time.Now()
+	shutdownDeadline := shutdownStart.Add(d.config.ShutdownTimeout)
+	shutdownCtx, shutdownCancel := context.WithDeadline(
+		context.Background(),
+		shutdownDeadline,
 	)
-	pendingStateCh := make(chan struct{}, 1)
-	go func() {
-		for ctx.Err() == nil {
-			var runtimeState RuntimeConfig
-			logger.InfoContext(ctx, "checking if runtime config exists yet")
-			getRuntimeStateErr := d.db.Last(&runtimeState).Error
-			if getRuntimeStateErr != nil {
-				logger.ErrorContext(
-					ctx,
-					"error getting runtime state",
-					tint.Err(getRuntimeStateErr),
-				)
-			}
-			if runtimeState.AdminUsername != "" && runtimeState.AdminPassword != "" {
-				pendingStateCh <- struct{}{}
-				return
-			}
-			time.Sleep(5 * time.Second)
-		}
-	}()
-
-	select {
-	case <-ctx.Done():
-		logger.WarnContext(ctx, "context cancelled waiting on setup, exiting")
-		return d.shutdown(ctx, runtimeWG)
-	case <-pendingStateCh:
-		d.pendingSetup.Store(false)
-	}
-
-	return nil
+	return shutdownCtx, shutdownCancel
 }
 
 // discordInit opens the discord websocket connection and registers commands,
@@ -976,17 +1125,20 @@ func (d *DisConcierge) discordInit(
 		return fmt.Errorf("error connecting to discord: %w", err)
 	}
 	if runtimeCfg.DiscordCustomStatus != "" && !d.paused.Load() {
-		go func() {
-			if statusErr := d.discord.session.UpdateCustomStatus(
-				runtimeCfg.DiscordCustomStatus,
-			); statusErr != nil {
-				logger.Error("error updating discord status", tint.Err(statusErr))
-			}
-		}()
+
+		if statusErr := d.discord.session.UpdateCustomStatus(
+			runtimeCfg.DiscordCustomStatus,
+		); statusErr != nil {
+			logger.Error("error updating discord status", tint.Err(statusErr))
+		}
+
 	}
 	return nil
 }
 
+// startWebhookServer starts the Discord webhook server in a separate
+// goroutine. The webhook server, when enabled, is used to receive
+// Discord interactions via webhook, rather than gateway connection.
 func (d *DisConcierge) startWebhookServer(ctx context.Context, runtimeWG *sync.WaitGroup) {
 	runtimeWG.Add(1)
 	go func() {
@@ -998,8 +1150,59 @@ func (d *DisConcierge) startWebhookServer(ctx context.Context, runtimeWG *sync.W
 	}()
 }
 
+// expiredInteractionRunUpdater, every UpdateExpiredRunCheckInterval,
+// checks for ChatCommand interactions with expired tokens, with in-progress
+// or queued OpenAI runs, and attempts to back-populate the result of those
+// runs, without attempting to update the discord interaction.
+func (d *DisConcierge) expiredInteractionRunUpdater(ctx context.Context) {
+	ticker := time.NewTicker(UpdateExpiredRunCheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			d.logger.Info("stopping run updater")
+			return
+		case <-ticker.C:
+			_ = d.populateExpiredInteractionRunStatus(
+				ctx,
+				15*time.Second,
+				time.Minute,
+				2,
+			)
+		}
+	}
+}
+
+// catchupAndWatchQueue first sets any ChatCommand without an in-progress or
+// queued run as 'expired' if the interaction token has expired.
+// Next, it attempts to finish any in-progress commands.
+// Finally, it starts watching the queue for new commands.
 func (d *DisConcierge) catchupAndWatchQueue(ctx context.Context, logger *slog.Logger) {
 	logger.InfoContext(ctx, "starting run catchup")
+
+	affected, updateErr := d.writeDB.UpdatesWhere(
+		ctx,
+		ChatCommand{},
+		map[string]any{
+			columnChatCommandState: ChatCommandStateExpired,
+		},
+		"token_expires is not null AND token_expires < ? AND state IN ? AND run_status NOT IN ?",
+		time.Now().UnixMilli(),
+		[]ChatCommandState{
+			ChatCommandStateInProgress,
+			ChatCommandStateQueued,
+		},
+		[]openai.RunStatus{
+			openai.RunStatusQueued,
+			openai.RunStatusInProgress,
+		},
+	)
+	if updateErr != nil {
+		logger.Error("error updating old commands", tint.Err(updateErr))
+	} else {
+		logger.Info(fmt.Sprintf("set %d records as expired", affected))
+	}
 	if catchupErr := d.catchupInterruptedRuns(ctx); catchupErr != nil {
 		logger.ErrorContext(
 			ctx,
@@ -1007,11 +1210,14 @@ func (d *DisConcierge) catchupAndWatchQueue(ctx context.Context, logger *slog.Lo
 			tint.Err(catchupErr),
 		)
 	}
+
 	logger.InfoContext(ctx, "starting queue watcher")
-	d.watchQueue(ctx)
+	d.watchQueue(ctx, nil)
 	logger.InfoContext(ctx, "queue watcher done")
 }
 
+// startUserCacheRefresher starts a goroutine that watches the channel for signals
+// to reload the entire user cache
 func (d *DisConcierge) startUserCacheRefresher(ctx context.Context, runtimeWG *sync.WaitGroup) {
 	userCacheTTL := d.config.UserCacheTTL
 
@@ -1069,6 +1275,8 @@ func (d *DisConcierge) startUserCacheRefresher(ctx context.Context, runtimeWG *s
 
 }
 
+// startUserUpdatedListener starts a goroutine that watches the channel for
+// signals to refresh specific users
 func (d *DisConcierge) startUserUpdatedListener(ctx context.Context, runtimeWG *sync.WaitGroup) {
 	runtimeWG.Add(1)
 	go func() {
@@ -1089,6 +1297,7 @@ func (d *DisConcierge) startUserUpdatedListener(ctx context.Context, runtimeWG *
 	}()
 }
 
+// refreshUser reloads the user for given user ID from the database
 func (d *DisConcierge) refreshUser(userID string) {
 	d.logger.Info("reloading user", "user_id", userID)
 	user := d.writeDB.ReloadUser(userID)
@@ -1164,12 +1373,14 @@ func (d *DisConcierge) startRuntimeConfigRefresher(
 	}()
 }
 
+// refreshRuntimeConfig replaces the current RuntimeConfig with the given
+// RuntimeConfig. It also updates the current logging levels.
 func (d *DisConcierge) refreshRuntimeConfig(ctx context.Context, force bool) {
+	// TODO this is outdated, no longer serves its original purpose
 	d.cfgMu.Lock()
 	defer d.cfgMu.Unlock()
 
 	runtimeConfigTTL := d.config.RuntimeConfigTTL
-	rollbackConfig := d.runtimeConfig
 
 	var refreshConfig RuntimeConfig
 	if err := d.db.WithContext(ctx).Last(&refreshConfig).Error; err != nil {
@@ -1185,235 +1396,100 @@ func (d *DisConcierge) refreshRuntimeConfig(ctx context.Context, force bool) {
 				lastUpdated.String(),
 			),
 		)
-		d.unsafeRefreshRuntimeConfig(rollbackConfig, &refreshConfig)
+		d.runtimeConfig = &refreshConfig
+		d.setRuntimeLevels(refreshConfig)
 	} else {
 		d.logger.Info("runtime config is up to date, skipping refresh")
 	}
 }
 
-// unsafeRefreshRuntimeConfig refreshes the runtime configuration without
-// locking the config mutex.
-func (d *DisConcierge) unsafeRefreshRuntimeConfig(
-	rollbackConfig *RuntimeConfig,
-	existingConfig *RuntimeConfig,
-) {
-	d.logger.Info("refreshing runtime configuration and user cache")
-	switch {
-	case rollbackConfig.DiscordGatewayEnabled && !existingConfig.DiscordGatewayEnabled:
-		if discErr := d.discord.session.Close(); discErr != nil {
-			d.logger.Error("error closing discord connection", tint.Err(discErr))
-		}
-	case rollbackConfig.DiscordGatewayEnabled && existingConfig.DiscordGatewayEnabled:
-		switch {
-		case existingConfig.Paused:
-			if !rollbackConfig.Paused {
-				if discErr := d.discord.session.UpdateStatusComplex(
-					discordgo.UpdateStatusData{
-						AFK:    true,
-						Status: string(discordgo.StatusDoNotDisturb),
-					},
-				); discErr != nil {
-					d.logger.Error("error updating discord status", tint.Err(discErr))
-				}
-			}
-		case existingConfig.DiscordCustomStatus != rollbackConfig.DiscordCustomStatus:
-			if discErr := d.discord.session.UpdateCustomStatus(
-				existingConfig.DiscordCustomStatus,
-			); discErr != nil {
-				d.logger.Error("error updating discord status", tint.Err(discErr))
-			}
-		}
-	case existingConfig.DiscordGatewayEnabled:
-		d.discord.session.SetIdentify(
-			discordgo.Identify{
-				Intents:  d.config.Discord.GatewayIntents,
-				Presence: getDiscordPresenceStatusUpdate(*existingConfig),
-			},
-		)
-		if discErr := d.discord.session.Open(); discErr != nil {
-			d.logger.Error("error opening discord connection", tint.Err(discErr))
-		}
-	}
-
-	d.runtimeConfig = existingConfig
-	d.setRuntimeLevels(*existingConfig)
-
-	d.logger.Info("refreshed runtime config")
-}
-
-func (d *DisConcierge) refreshUserCache(ctx context.Context) {
+func (d *DisConcierge) refreshUserCache(_ context.Context) {
 	d.writeDB.UserCacheLock()
 	defer d.writeDB.UserCacheUnlock()
 	_ = d.writeDB.LoadUsers()
 }
 
-func (d *DisConcierge) shutdown(
-	ctx context.Context,
-	runtimeWG *sync.WaitGroup,
-) error {
+// shutdown attempts to gracefully shut down the bot, close HTTP servers, etc.
+func (d *DisConcierge) shutdown(ctx context.Context) error {
 	d.logger.WarnContext(ctx, "shutting down")
 	defer func() {
 		if d.eventShutdown != nil {
-			go func() {
-				d.eventShutdown <- struct{}{}
-			}()
+			select {
+			case d.eventShutdown <- struct{}{}:
+			//
+			case <-time.After(10 * time.Second):
+				d.logger.Warn("timed out sending shutdown signal")
+			}
 		}
 	}()
-	shutdownStart := time.Now()
-	shutdownTimeout := d.config.ShutdownTimeout
-	if shutdownTimeout.Seconds() == 0 {
-		d.logger.Warn("immediate shutdown")
-		go func() {
-			_ = d.api.httpServer.Close()
-		}()
-		return fmt.Errorf("request worker did not stop in time")
-	}
-	shutdownDeadline := shutdownStart.Add(shutdownTimeout)
 
-	shutdownAnnouncementInterval := 10 * time.Second
-
-	announcementTicker := time.NewTicker(shutdownAnnouncementInterval)
-	defer announcementTicker.Stop()
-
+	runtimeStopEnd := time.Now()
 	d.logger.InfoContext(
 		ctx,
-		"exiting!",
-		"shutdown_timeout", d.config.ShutdownTimeout,
-		"shutdown_started", shutdownStart,
-		"shutdown_deadline", shutdownDeadline,
+		"finished handling in-flight requests",
+		"runtime_stopped", runtimeStopEnd,
+	)
+	g := new(errgroup.Group)
+
+	// flush the queue
+	g.Go(
+		func() error {
+			return d.flushRequestQueue(ctx)
+		},
 	)
 
-	closeCtx, closeCancel := context.WithDeadline(
-		context.Background(),
-		shutdownDeadline,
+	g.Go(
+		func() error {
+			return d.stopUserWorkers(ctx)
+		},
 	)
-	defer closeCancel()
 
-	// Graceful shutdown - at least until closeCtx is closed
+	g.Go(
+		func() error {
+			return d.shutdownAPIServer(ctx)
+		},
+	)
+
+	if d.discordWebhookServer != nil {
+		g.Go(
+			func() error {
+				return d.shutdownWebhookServer(ctx)
+			},
+		)
+	}
+
+	if d.discordWebhookServer != nil {
+		g.Go(
+			func() error {
+				return d.shutdownDiscordSession(ctx)
+			},
+		)
+	}
+
+	// wait on the above, then send a signal that we're done
+
+	// Graceful shutdown - at least until ctx is closed
 	gracefulShutdownCh := make(chan struct{}, 1)
 	go func() {
-		runtimeWG.Wait() // wait for anything spawned by the main processes
-		runtimeStopEnd := time.Now()
-		d.logger.InfoContext(
-			ctx,
-			"finished handling in-flight requests",
-			"shutdown_started", shutdownStart,
-			"runtime_stopped", runtimeStopEnd,
-			"runtime_stop_duration", runtimeStopEnd.Sub(shutdownStart),
-		)
-		stopWG := &sync.WaitGroup{}
-
-		// flush the queue
-		if d.requestQueue != nil {
-			stopWG.Add(1)
-			go func() {
-				defer stopWG.Done()
-				queueFlushCt := 0
-				for d.requestQueue.Len() > 0 {
-					rq := d.requestQueue.Clear(context.Background())
-					if rq != nil {
-						queueFlushCt++
-					} else {
-						break
-					}
-				}
-				d.logger.InfoContext(
-					ctx,
-					"purged request queue",
-					"count", queueFlushCt,
-				)
-			}()
+		d.logger.InfoContext(ctx, "waiting graceful shutdown")
+		err := g.Wait()
+		if err != nil {
+			d.logger.Error("error(s) during shutdown", tint.Err(err))
 		}
 
-		stopWG.Add(1)
-		go func() {
-			defer stopWG.Done()
-
-			d.userWorkerMu.Lock()
-			defer d.userWorkerMu.Unlock()
-
-			if d.userWorkers != nil {
-				for wid, worker := range d.userWorkers {
-					stopWG.Add(1)
-					go func(workerID string, w *userCommandWorker) {
-						defer stopWG.Done()
-						d.logger.Info(
-							fmt.Sprintf(
-								"sending stop signal to worker for user '%s'",
-								workerID,
-							),
-						)
-						w.signalStop <- struct{}{}
-						d.logger.Info(
-							fmt.Sprintf(
-								"sent stop signal to user worker '%s' - waiting on confirmation",
-								workerID,
-							),
-						)
-						<-w.stopped
-						d.logger.Info(
-							fmt.Sprintf(
-								"confirmed worker '%s' stopped",
-								workerID,
-							),
-						)
-					}(wid, worker)
-				}
-			}
-			d.userWorkers = map[string]*userCommandWorker{}
-		}()
-
-		if d.api.httpServer != nil {
-			stopWG.Add(1)
-			go func() {
-				defer stopWG.Done()
-				d.logger.InfoContext(ctx, "stopping http server")
-				_ = d.api.httpServer.Shutdown(closeCtx)
-				d.logger.InfoContext(ctx, "http server stopped")
-			}()
-		}
-
-		if d.discordWebhookServer != nil {
-			stopWG.Add(1)
-			go func() {
-				defer stopWG.Done()
-				d.logger.InfoContext(ctx, "stopping webhook http server")
-				_ = d.discordWebhookServer.httpServer.Shutdown(closeCtx)
-				d.logger.InfoContext(ctx, "webhook http server stopped")
-			}()
-		}
-
-		if d.discord.session != nil {
-			stopWG.Add(1)
-			go func() {
-				defer stopWG.Done()
-				d.logger.InfoContext(ctx, "closing discord session")
-				_ = d.discord.session.Close()
-				d.logger.InfoContext(ctx, "discord session closed")
-				if len(d.discord.discordgoRemoveHandlerFuncs) > 0 {
-					d.logger.InfoContext(
-						ctx,
-						fmt.Sprintf(
-							"removing %d discord handlers",
-							len(d.discord.discordgoRemoveHandlerFuncs),
-						),
-					)
-					for _, h := range d.discord.discordgoRemoveHandlerFuncs {
-						h()
-					}
-					d.logger.InfoContext(ctx, "finished removing handlers")
-				}
-			}()
-		}
-
-		// wait on the above, then send a signal that we're done
-		go func() {
-			d.logger.InfoContext(ctx, "waiting graceful shutdown")
-			stopWG.Wait()
+		if ctx.Err() == nil {
 			gracefulShutdownCh <- struct{}{}
-			d.logger.InfoContext(ctx, "stopped http/discord")
-		}()
+			d.logger.InfoContext(ctx, "all processes gracefully stopped")
+			close(gracefulShutdownCh)
+		}
 	}()
+
+	var tickerCh <-chan time.Time
+	if ShutdownAnnouncementInterval > 0 {
+		announcementTicker := time.NewTicker(ShutdownAnnouncementInterval)
+		defer announcementTicker.Stop()
+		tickerCh = announcementTicker.C
+	}
 
 	// if we get a signal on gracefulShutdownCh, everything stopped and
 	// cleaned up normally.
@@ -1421,35 +1497,25 @@ func (d *DisConcierge) shutdown(
 	for {
 		select {
 		case <-gracefulShutdownCh:
-			closeCancel()
 			shutdownEnded := time.Now()
 			d.logger.InfoContext(
 				ctx,
 				"shutdown complete",
 				"shutdown_ended", shutdownEnded,
-				"shutdown_duration", shutdownEnded.Sub(shutdownStart),
 			)
 			return nil
-		case <-announcementTicker.C:
-			remaining := time.Until(shutdownDeadline)
-			d.logger.Warn(
-				fmt.Sprintf(
-					"time until hard shutdown: %s",
-					remaining.String(),
-				),
-			)
-		case <-closeCtx.Done(): // timed out, enqueue closing stuff
-			d.logger.Warn("request worker did not stop in time, forcing close")
-
-			go func() {
-				_ = d.api.httpServer.Close()
-			}()
-			if d.discordWebhookServer != nil {
-				go func() {
-					_ = d.discordWebhookServer.httpServer.Close()
-				}()
+		case <-tickerCh:
+			deadline, ok := ctx.Deadline()
+			if ok {
+				d.logger.Warn(
+					fmt.Sprintf(
+						"time until hard shutdown: %s",
+						time.Until(deadline).String(),
+					),
+				)
 			}
-
+		case <-ctx.Done(): // timed out, enqueue closing stuff
+			d.logger.Warn("did not stop in time, forcing close")
 			return fmt.Errorf("request worker did not stop in time")
 		}
 	}
@@ -1494,10 +1560,9 @@ func (d *DisConcierge) initRun(startCtx context.Context, ctx context.Context) er
 	getStateErr := d.db.Last(&botState).Error
 	if getStateErr != nil {
 		if errors.Is(getStateErr, gorm.ErrRecordNotFound) {
-			d.pendingSetup.Store(true)
 			botState = DefaultRuntimeConfig()
 
-			if _, err := d.writeDB.Create(&botState); err != nil {
+			if _, err := d.writeDB.Create(context.TODO(), &botState); err != nil {
 				return fmt.Errorf("error creating config: %w", err)
 			}
 		} else {
@@ -1509,7 +1574,7 @@ func (d *DisConcierge) initRun(startCtx context.Context, ctx context.Context) er
 	}
 
 	if botState.AdminUsername == "" || botState.AdminPassword == "" {
-		d.pendingSetup.Store(true)
+		d.logger.Warn("admin credentials not set")
 	}
 	d.paused.Store(botState.Paused)
 	d.setRuntimeLevels(botState)
@@ -1535,6 +1600,7 @@ func (d *DisConcierge) initRun(startCtx context.Context, ctx context.Context) er
 	return nil
 }
 
+// initDiscordSession creates and opens a discord gateway websocket connection.
 func (d *DisConcierge) initDiscordSession(ctx context.Context, runtimeWG *sync.WaitGroup) error {
 	logger := d.logger.With(loggerNameKey, "discord_session")
 
@@ -1572,23 +1638,28 @@ func (d *DisConcierge) initDiscordSession(ctx context.Context, runtimeWG *sync.W
 		d.discord.session.AddHandler(d.discord.handlerDisconnect()),
 		d.discord.session.AddHandler(d.discord.handlerReady()),
 		d.discord.session.AddHandler(
-			func(
-				_ *discordgo.Session,
-				i *discordgo.InteractionCreate,
-			) {
+			func(_ *discordgo.Session, i *discordgo.InteractionCreate) {
 				handler := d.getInteractionHandlerFunc(ctx, i)
 				runtimeWG.Add(1)
+				recoverPanic := handler.Config().RecoverPanic
 				go func() {
-					defer runtimeWG.Done()
+					d.logger.Error("recover panic", tint.Err(fmt.Errorf("%v", recoverPanic)))
+					if recoverPanic {
+						defer func() {
+							if rc := recover(); rc != nil {
+								d.handleRecover(ctx, rc)
+							}
+							runtimeWG.Done()
+						}()
+					} else {
+						runtimeWG.Done()
+					}
 					d.handleInteraction(ctx, handler)
 				}()
 			},
 		),
 		d.discord.session.AddHandler(
-			func(
-				_ *discordgo.Session,
-				m *discordgo.MessageCreate,
-			) {
+			func(_ *discordgo.Session, m *discordgo.MessageCreate) {
 				runtimeWG.Add(1)
 				go func() {
 					defer runtimeWG.Done()
@@ -1609,10 +1680,7 @@ func (d *DisConcierge) initDiscordSession(ctx context.Context, runtimeWG *sync.W
 				config:      d.RuntimeConfig().CommandOptions,
 				mu:          &sync.RWMutex{},
 				logger: d.logger.With(
-					slog.Group(
-						"interaction",
-						interactionLogAttrs(*i)...,
-					),
+					slog.Group("interaction", interactionLogAttrs(*i)...),
 				),
 			}
 			return handler
@@ -1621,85 +1689,30 @@ func (d *DisConcierge) initDiscordSession(ctx context.Context, runtimeWG *sync.W
 	return nil
 }
 
-// Pause 'pauses' the bot. While paused, ChatCommand nor ClearCommand
-// will be queued or executed - unless User.Priority is set. In that case,
-// that user's incoming ChatCommand will be queued, though not executed
-// until the bot is resumed.
-func (d *DisConcierge) Pause(ctx context.Context) bool {
-	prev := d.paused.Swap(true)
-	if prev {
-		return false
-	}
-
-	if err := d.discord.updateStatusComplex(
-		discordgo.UpdateStatusData{
-			AFK:    true,
-			Status: string(discordgo.StatusDoNotDisturb),
-		},
-	); err != nil {
-		d.logger.ErrorContext(ctx, "unable to update afk status", tint.Err(err))
-	}
-	if !d.runtimeConfig.Paused {
-		if _, err := d.writeDB.Update(
-			d.runtimeConfig,
-			"paused",
-			true,
-		); err != nil {
-			d.logger.ErrorContext(ctx, "unable to set paused in db", tint.Err(err))
-		}
-	}
-	return true
-}
-
-// Resume resumes command processing. It returns a bool indicating whether
-// the bot was paused at the time the function was called.
-func (d *DisConcierge) Resume(ctx context.Context) bool {
-	prev := d.paused.Swap(false)
-	if !prev {
-		d.logger.Warn("bot not paused")
-		return false
-	}
-	d.logger.InfoContext(ctx, "bot resumed")
-
-	if err := d.discord.updateCustomStatus(d.runtimeConfig.DiscordCustomStatus); err != nil {
-		d.logger.ErrorContext(ctx, "unable to update noline status", tint.Err(err))
-	}
-
-	if d.runtimeConfig.Paused {
-		if _, err := d.writeDB.Update(
-			d.runtimeConfig, columnRuntimeConfigPaused, false,
-		); err != nil {
-			d.logger.ErrorContext(ctx, "unable to set resumed in db", tint.Err(err))
-		}
-	}
-
-	return true
-}
-
 // watchQueue is the main loop for handling ChatCommand requests.
-func (d *DisConcierge) watchQueue(ctx context.Context) {
+func (d *DisConcierge) watchQueue(ctx context.Context, requestCh chan *ChatCommand) {
 	defer func() {
 		d.logger.InfoContext(
 			ctx,
 			"queue watcher stopped",
-			"queue_size",
-			d.requestQueue.Len(),
+			"queue_size", d.requestQueue.Len(),
 		)
 	}()
-
-	d.requestQueue.requestCh = make(chan *ChatCommand)
+	if requestCh == nil {
+		requestCh = make(chan *ChatCommand)
+	}
+	d.requestQueue.requestCh = requestCh
 
 	wg := &sync.WaitGroup{}
-	defer func() {
-		wg.Wait()
-	}()
+	defer wg.Wait()
 
 	wg.Add(1)
 	go func() {
-		swg := &sync.WaitGroup{}
+		// Until the context is cancelled, continuously pops ChatCommand
+		// instances off the queue
+
 		defer func() {
-			close(d.requestQueue.requestCh)
-			swg.Wait()
+			close(requestCh)
 			wg.Done()
 		}()
 
@@ -1729,43 +1742,25 @@ func (d *DisConcierge) watchQueue(ctx context.Context) {
 				),
 			)
 
-			if req.State == ChatCommandStateQueued {
-				logger.InfoContext(
-					ctx,
-					"popped request",
-					slog.Group(
-						"chat_command",
-						columnChatCommandStep, req.Step,
-						columnChatCommandState, req.State,
-					),
-				)
-			} else {
-				logger.WarnContext(
-					ctx,
-					fmt.Sprintf(
-						"expected state '%s', got: '%s'",
-						ChatCommandStateQueued,
-						req.State,
-					),
-					slog.Group(
-						"chat_command",
-						columnChatCommandStep, req.Step,
-						columnChatCommandState, req.State,
-					),
-				)
-			}
-
+			logger.Info(
+				"popped request",
+				slog.Group(
+					"chat_command",
+					columnChatCommandStep, req.Step,
+					columnChatCommandState, req.State,
+				),
+			)
 			d.requestQueue.requestCh <- req
 		}
 	}()
 
-	for req := range d.requestQueue.requestCh {
+	for req := range requestCh {
 		logger := d.logger.With(
 			slog.Group("chat_command", chatCommandLogAttrs(*req)...),
 		)
 
 		reqAge := req.Age()
-		if d.config.Queue.MaxAge > 0 && reqAge > d.config.Queue.MaxAge {
+		if (d.config.Queue.MaxAge > 0 && reqAge > d.config.Queue.MaxAge) && !req.OpenAIRunInProgress() {
 			req.State = ChatCommandStateExpired
 			logger.WarnContext(
 				ctx,
@@ -1777,6 +1772,7 @@ func (d *DisConcierge) watchQueue(ctx context.Context) {
 			go func() {
 				defer wg.Done()
 				if _, err := d.writeDB.Update(
+					context.TODO(),
 					req,
 					columnChatCommandState,
 					ChatCommandStateExpired,
@@ -1794,7 +1790,7 @@ func (d *DisConcierge) watchQueue(ctx context.Context) {
 		if req.User.Ignored {
 			logger.WarnContext(
 				ctx,
-				"ignoring blocked User request",
+				"ignoring blocked user request",
 				slog.Group(
 					"chat_command",
 					columnChatCommandStep, req.Step,
@@ -1806,6 +1802,7 @@ func (d *DisConcierge) watchQueue(ctx context.Context) {
 			go func() {
 				defer wg.Done()
 				if _, err := d.writeDB.Update(
+					context.TODO(),
 					req,
 					columnChatCommandState,
 					ChatCommandStateIgnored,
@@ -1821,11 +1818,15 @@ func (d *DisConcierge) watchQueue(ctx context.Context) {
 			continue
 		}
 
+		if ctx.Err() != nil {
+			// if we're stopping, instead of returning, update as many records
+			// as we can with the above checks
+			continue
+		}
 		startedAt := time.Now()
 		req.StartedAt = &startedAt
 
 		userWorker := d.getUserWorker(ctx, req.User)
-
 		sendCtx, sendCancel := context.WithTimeout(ctx, UserWorkerSendTimeout)
 
 		select {
@@ -1839,167 +1840,111 @@ func (d *DisConcierge) watchQueue(ctx context.Context) {
 			// Then, we delete that semi-temporary message after
 			// 20 seconds.
 			logger.WarnContext(ctx, "timed out sending user request")
+
 			wg.Add(1)
-			go func(r *ChatCommand) {
-				reqCtx := ctx
-				config := r.handler.Config()
-				if config.RecoverPanic {
-					defer func() {
-						if rc := recover(); rc != nil {
-							d.handleRecover(reqCtx, rc)
-						}
-					}()
-				}
+			go func() {
 				defer wg.Done()
 
-				reqLogger, ok := ContextLogger(reqCtx)
-				if reqLogger == nil || !ok {
-					reqLogger = slog.Default()
-				}
-				reqLogger = reqLogger.With(
-					slog.Group("chat_command", chatCommandLogAttrs(*r)...),
-				)
-				reqCtx = WithLogger(reqCtx, reqLogger)
-
-				reqLogger.WarnContext(
-					reqCtx,
-					"request already in progress for user",
-				)
-				responseMsg := config.DiscordRateLimitMessage
-				finishedAt := time.Now()
-
-				swg := &sync.WaitGroup{}
-				swg.Add(1)
-				go func() {
-					defer swg.Done()
-					reqLogger.WarnContext(
-						reqCtx,
-						"command rate-limited due to worker send timeout",
-					)
-					if _, err := d.writeDB.ChatCommandUpdates(
-						r,
-						map[string]any{
-							columnChatCommandState:      ChatCommandStateRateLimited,
-							columnChatCommandStep:       "",
-							columnChatCommandFinishedAt: &finishedAt,
-							columnChatCommandStartedAt:  &startedAt,
-							columnChatCommandResponse:   &responseMsg,
-						},
-					); err != nil {
-						reqLogger.ErrorContext(
-							reqCtx,
-							"error saving rate limited request",
-							tint.Err(err),
-						)
-					}
-				}()
-
-				swg.Add(1)
-				go func() {
-					defer swg.Done()
-					_, editErr := r.handler.Edit(
-						reqCtx,
-						&discordgo.WebhookEdit{Content: &responseMsg},
-					)
-					if editErr != nil {
-						reqLogger.WarnContext(
-							reqCtx,
-							"failed to edit message",
-							tint.Err(editErr),
-						)
-						return
-					}
-					reqLogger.InfoContext(
-						reqCtx,
-						fmt.Sprintf(
-							"temporary busy message will be deleted in: %s",
-							busyInteractionDeleteDelay.String(),
-						),
-					)
-					deleteTimer := time.NewTimer(busyInteractionDeleteDelay)
-					d.messageDeleteTimersRunning.Add(1)
-					defer func() {
-						d.messageDeleteTimersRunning.Add(-1)
-						deleteTimer.Stop()
-						select {
-						case <-deleteTimer.C:
-							//
-						default:
-							//
-						}
-					}()
-					select {
-					case <-ctx.Done():
-						reqLogger.InfoContext(
-							reqCtx,
-							"context cancelled, deleting rate-limited interaction response NOW",
-						)
-						delCtx, delCancel := context.WithTimeout(
-							context.Background(),
-							5*time.Second,
-						)
-						defer delCancel()
-						r.handler.Delete(
-							ctx,
-							discordgo.WithRetryOnRatelimit(false),
-							discordgo.WithContext(delCtx),
-						)
-					case <-deleteTimer.C:
-						reqLogger.InfoContext(
-							reqCtx,
-							"deleting rate-limited interaction response",
-						)
-						r.handler.Delete(ctx)
-					}
-				}()
-				swg.Wait()
-			}(req)
+				d.handleWorkerSendTimeout(ctx, wg, startedAt, req)
+			}()
 		}
 		sendCancel()
 	}
 }
 
-func notifyDiscordUserReachedRateLimit(
+// handleWorkerSendTimeout handles the case where a request is already in
+// progress for a user, so sending to the userCommandWorker channel times
+// out. The request should be updated with a state to prevent it from
+// being resumed/executed, and the user should get a message indicating
+// why the bot isn't responding normally. The message, by default,
+// should be deleted after a short delay, to avoid cluttering the chat.
+func (d *DisConcierge) handleWorkerSendTimeout(
 	ctx context.Context,
-	logger *slog.Logger,
-	d *Discord,
-	user *User,
-	usage ChatCommandUsage,
-	prompt string,
-	notificationChannelID string,
+	wg *sync.WaitGroup,
+	startedAt time.Time,
+	r *ChatCommand,
 ) {
-	if usage.Billable6h < usage.Limit6h {
-		return
+	config := r.handler.Config()
+
+	reqLogger, ok := ContextLogger(ctx)
+	if reqLogger == nil || !ok {
+		reqLogger = slog.Default()
+	}
+	reqLogger = reqLogger.With(
+		slog.Group("chat_command", chatCommandLogAttrs(*r)...),
+	)
+	ctx = WithLogger(ctx, reqLogger)
+
+	reqLogger.WarnContext(ctx, "request already in progress for user")
+	responseMsg := config.DiscordRateLimitMessage
+	if responseMsg == "" {
+		responseMsg = DefaultDiscordRateLimitMessage
+		reqLogger.Warn(
+			fmt.Sprintf(
+				"Discord rate limit message not configured, using default: %q",
+				responseMsg,
+			),
+		)
+	}
+	finishedAt := time.Now()
+
+	reqLogger.Warn("command rate-limited due to worker send timeout")
+
+	if _, err := d.writeDB.ChatCommandUpdates(
+		context.TODO(), r, map[string]any{
+			columnChatCommandState:      ChatCommandStateRateLimited,
+			columnChatCommandStep:       "",
+			columnChatCommandFinishedAt: &finishedAt,
+			columnChatCommandStartedAt:  &startedAt,
+			columnChatCommandResponse:   &responseMsg,
+		},
+	); err != nil {
+		reqLogger.Error("error saving rate limited request", tint.Err(err))
 	}
 
-	if notificationChannelID == "" {
-		logger.Info("no discord notification channel set, skipping")
+	if _, e := r.handler.Edit(ctx, &discordgo.WebhookEdit{Content: &responseMsg}); e != nil {
 		return
 	}
-
-	if sendErr := d.channelMessageSend(
-		notificationChannelID,
+	reqLogger.InfoContext(
+		ctx,
 		fmt.Sprintf(
-			"User `%s` (`%s`) reached their rate limit.\n"+
-				"- **6h**: Attempted: %d / Billable: %d / Limit: %d\n"+
-				"- Available: %s"+
-				"Prompt:\n"+
-				"```\n"+
-				"%s\n"+
-				"```\n",
-			user.GlobalName,
-			user.ID,
-			usage.Attempted6h,
-			usage.Billable6h,
-			usage.Limit6h,
-
-			usage.CommandsAvailableAt.String(),
-			prompt,
+			"temporary busy message will be deleted in: %s",
+			busyInteractionDeleteDelay.String(),
 		),
-		discordgo.WithContext(ctx),
-	); sendErr != nil {
-		logger.Error("error sending error notification", tint.Err(sendErr))
-	}
+	)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		deleteTimer := time.NewTimer(busyInteractionDeleteDelay)
+		d.messageDeleteTimersRunning.Add(1)
+		defer func() {
+			deleteTimer.Stop()
+			select {
+			case <-deleteTimer.C:
+			default:
+			}
+			d.messageDeleteTimersRunning.Add(-1)
+		}()
+
+		select {
+		case <-ctx.Done():
+			reqLogger.Info(
+				"context cancelled, deleting rate-limited interaction response NOW",
+			)
+			delCtx, delCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer delCancel()
+			r.handler.Delete(
+				ctx,
+				discordgo.WithRetryOnRatelimit(false),
+				discordgo.WithContext(delCtx),
+			)
+		case <-deleteTimer.C:
+			reqLogger.Info("deleting rate-limited interaction response")
+			r.handler.Delete(ctx)
+		}
+	}()
 }
 
 // GetOrCreateUser will retrieve an existing (cached) User to return,
@@ -2107,73 +2052,8 @@ func (d *DisConcierge) initDB(ctx context.Context) error {
 		}
 	}
 
-	logger.Debug("migrating database...")
-	txn := db.WithContext(ctx).Begin()
-
-	mg := txn.Migrator()
-	err = mg.AutoMigrate(
-		&OpenAICreateThread{},
-		&OpenAICreateMessage{},
-		&OpenAICreateRun{},
-		&OpenAIRetrieveRun{},
-		&OpenAIListMessages{},
-		&OpenAIListRunSteps{},
-		&User{},
-		&ChatCommand{},
-		&ClearCommand{},
-		&UserFeedback{},
-		&RuntimeConfig{},
-		&InteractionLog{},
-		&DiscordMessage{},
-	)
-	if err != nil {
-		logger.Error("error migrating database", tint.Err(err))
-		return fmt.Errorf("error migrating database: %w", err)
-	}
-	logger.Debug("finished migrating database")
-
-	commitErr := txn.Commit().Error
-	if commitErr != nil {
-		return fmt.Errorf("error committing transaction: %w", commitErr)
-	}
 	_ = d.writeDB.LoadUsers()
 	return nil
-}
-
-// DiscordStatus represents the metrics related to Discord interactions.
-//
-// Fields:
-//   - MessagesHandled: The number of messages handled by the bot.
-//   - Connects: The number of times the bot has connected to Discord.
-//   - Disconnects: The number of times the bot has disconnected from Discord.
-type DiscordStatus struct {
-	MessagesHandled int64 `json:"messages_handled"`
-	Connects        int64 `json:"connects"`
-	Disconnects     int64 `json:"disconnects"`
-}
-
-// OpenAIStatus represents the metrics related to OpenAI API usage.
-//
-// Fields:
-//   - CreateMessage: The number of messages created using the OpenAI API.
-//   - CreateRun: The number of runs created using the OpenAI API.
-//   - CreateThread: The number of threads created using the OpenAI API.
-//   - RetrieveRun: The number of runs retrieved using the OpenAI API.
-//   - ListMessage: The number of messages listed using the OpenAI API.
-//   - RunStatus: A map of run statuses and their counts.
-//   - PromptTokens: The number of prompt tokens used.
-//   - CompletionTokens: The number of completion tokens used.
-//   - TotalTokens: The total number of tokens used.
-type OpenAIStatus struct {
-	CreateMessage    int64                    `json:"create_message"`
-	CreateRun        int64                    `json:"create_run"`
-	CreateThread     int64                    `json:"create_thread"`
-	RetrieveRun      int64                    `json:"retrieve_run"`
-	ListMessage      int64                    `json:"list_message"`
-	RunStatus        map[openai.RunStatus]int `json:"run_status"`
-	PromptTokens     int                      `json:"prompt_tokens"`
-	CompletionTokens int                      `json:"completion_tokens"`
-	TotalTokens      int                      `json:"total_tokens"`
 }
 
 // interactionResponseToSubmittedModal returns an interaction response, in
@@ -2182,12 +2062,16 @@ type OpenAIStatus struct {
 func (d *DisConcierge) interactionResponseToSubmittedModal(
 	ctx context.Context,
 	i *discordgo.InteractionCreate,
-) *discordgo.InteractionResponse {
+	handler InteractionHandler,
+) error {
 	logger, ok := ContextLogger(ctx)
 	if logger == nil || !ok {
 		logger = d.logger
 		ctx = WithLogger(ctx, logger)
 	}
+
+	ackCtx, ackCancel := context.WithTimeout(ctx, discordAckTimeout)
+	defer ackCancel()
 
 	modalData := i.ModalSubmitData()
 	logger.InfoContext(
@@ -2208,83 +2092,90 @@ func (d *DisConcierge) interactionResponseToSubmittedModal(
 		"chat_command", reportData.ChatCommand,
 	)
 
-	chatCommand := reportData.ChatCommand
-	logger.InfoContext(
-		ctx,
-		"creating user feedback",
-		"chat_command", structToSlogValue(chatCommand),
-		"report", structToSlogValue(reportData),
-	)
-
-	if err = d.hydrateChatCommand(ctx, chatCommand); err != nil {
-		logger.ErrorContext(ctx, "error hydrating discord message", tint.Err(err))
-		return nil
-	}
-
-	if chatCommand.hasPrivateFeedback() {
-		userReport := UserFeedback{
-			ChatCommandID: &chatCommand.ID,
-			UserID:        &chatCommand.UserID,
-			Description:   feedbackTypeDescription[reportData.CustomID.ReportType],
-			Type:          string(reportData.CustomID.ReportType),
-			Detail:        reportData.Report,
-			CustomID:      reportData.CustomID.ID,
-		}
-		err = chatCommand.newDMReport(ctx, d.writeDB, &userReport)
-		go d.notifyDiscordUserFeedback(context.Background(), *chatCommand, userReport)
-		if err != nil {
-			logger.ErrorContext(
-				ctx,
-				"error creating UserFeedback",
-				tint.Err(err),
-				"user_report", structToSlogValue(userReport),
-				"discord_message", structToSlogValue(chatCommand),
-			)
-		}
-		return &discordgo.InteractionResponse{
-			Type: discordgo.InteractionResponseDeferredMessageUpdate,
-		}
-	}
-
-	var reportingUser *User
-
 	reportingDiscordUser := getDiscordUser(i)
-	if reportingDiscordUser.ID == chatCommand.UserID {
-		reportingUser = chatCommand.User
-	} else {
-		logger.InfoContext(
-			ctx,
-			"user providing feedback not the same as the user triggering the command",
-			"command_user_id", chatCommand.UserID,
-			"reporting_user_id", reportingDiscordUser.ID,
-			"reporting_username", reportingDiscordUser.Username,
-			"reporting_global_name", reportingDiscordUser.GlobalName,
-		)
-		reportingUser, _, err = d.GetOrCreateUser(ctx, *reportingDiscordUser)
-		if err != nil {
-			logger.ErrorContext(ctx, "error getting reporting user", tint.Err(err))
-			return nil
-		}
+
+	user, _, err := d.GetOrCreateUser(ctx, *reportingDiscordUser)
+	if err != nil {
+		logger.ErrorContext(ctx, "error getting reporting user", tint.Err(err))
+		return fmt.Errorf("error getting reporting user: %w", err)
 	}
+
+	logger = logger.With("user", user)
+	ctx = WithLogger(ctx, logger)
+
+	chatCommand := reportData.ChatCommand
 
 	userReport := UserFeedback{
 		ChatCommandID: &chatCommand.ID,
-		UserID:        &reportingUser.ID,
+		UserID:        &user.ID,
 		Description:   feedbackTypeDescription[reportData.CustomID.ReportType],
 		Type:          string(reportData.CustomID.ReportType),
 		Detail:        reportData.Report,
 		CustomID:      reportData.CustomID.ID,
 	}
-	if _, err = d.writeDB.Create(&userReport); err != nil {
+
+	defer func() {
+		nctx, ncancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer ncancel()
+		d.notifyDiscordUserFeedback(nctx, *chatCommand, userReport, *user)
+	}()
+
+	if _, err = d.writeDB.Create(context.TODO(), &userReport); err != nil {
 		logger.ErrorContext(ctx, "error creating user feedback", tint.Err(err))
-		go d.notifyDiscordUserFeedback(context.Background(), *chatCommand, userReport)
-		return nil
+		return fmt.Errorf("error creating user feedback: %w", err)
 	}
 
-	go d.notifyDiscordUserFeedback(context.Background(), *chatCommand, userReport)
-	return &discordgo.InteractionResponse{
-		Type: discordgo.InteractionResponseDeferredMessageUpdate,
+	// if for whatever reason we can't get the original content of the message,
+	// we'll just update the interaction with the default response - otherwise,
+	// we'd end up wiping out the message content with the update
+	var content string
+	if i.Message != nil {
+		content = i.Message.Content
 	}
+	if content == "" && chatCommand.Response != nil {
+		content = *chatCommand.Response
+	}
+
+	if content == "" {
+		logger.Warn("no content to update")
+		err = handler.Respond(
+			ackCtx,
+			&discordgo.InteractionResponse{
+				Type: discordgo.InteractionResponseDeferredMessageUpdate,
+			},
+			discordgo.WithContext(ackCtx),
+		)
+		if err != nil {
+			logger.ErrorContext(ctx, "error editing interaction", tint.Err(err))
+		}
+		return err
+	}
+
+	feedbackCounts, err := GetFeedbackCounts(ctx, d.db, chatCommand.ID)
+	if err != nil {
+		logger.Error("error getting feedback counts", tint.Err(err))
+		return err
+	}
+	buttonComponents := chatCommand.discordUserFeedbackComponents(feedbackCounts)
+
+	err = handler.Respond(
+		ackCtx,
+		&discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseUpdateMessage,
+			Data: &discordgo.InteractionResponseData{
+				Content:    content,
+				Components: buttonComponents,
+			},
+		},
+		discordgo.WithContext(ackCtx),
+	)
+
+	if err != nil {
+		logger.ErrorContext(ctx, "error editing interaction", tint.Err(err))
+		return err
+	}
+
+	return nil
 }
 
 // interactionResponseToMessageComponent processes an interaction that's the result of
@@ -2293,7 +2184,8 @@ func (d *DisConcierge) interactionResponseToSubmittedModal(
 func (d *DisConcierge) interactionResponseToMessageComponent(
 	ctx context.Context,
 	i *discordgo.InteractionCreate,
-) (*discordgo.InteractionResponse, error) {
+	handler InteractionHandler,
+) error {
 	logger, ok := ContextLogger(ctx)
 	if logger == nil || !ok {
 		logger = d.logger
@@ -2304,49 +2196,42 @@ func (d *DisConcierge) interactionResponseToMessageComponent(
 	customID, err := decodeCustomID(componentData.CustomID)
 	if err != nil {
 		logger.ErrorContext(ctx, "error decoding custom_id", tint.Err(err))
-		return nil, fmt.Errorf("error decoding custom_id: %w", err)
+		return fmt.Errorf("error decoding custom_id: %w", err)
 	}
-
-	cdata, _ := json.Marshal(componentData)
-	logger.InfoContext(
-		ctx,
-		"received button component interaction",
-		"custom_id", customID,
-		"component_data", string(cdata),
-	)
 
 	logger = logger.With("custom_id", customID)
 	ctx = WithLogger(ctx, logger)
 
-	logger.InfoContext(ctx, "received discord button push", "custom_id", customID)
+	logger.InfoContext(ctx, "received discord button push")
 
-	var chatCmd ChatCommand
-	rv := d.db.Where("custom_id = ?", customID.ID).Omit("User").First(&chatCmd)
-	if rv.Error != nil {
-		logger.ErrorContext(
-			ctx,
-			"error finding chat_command for the given custom_id",
-			tint.Err(rv.Error),
-			"custom_id", customID.ID,
-		)
-		return nil, fmt.Errorf(
-			"error finding chat_command for custom_id '%s': %w",
-			customID.ID, rv.Error,
-		)
-	}
-	chatCommand := &chatCmd
+	ackCtx, ackCancel := context.WithTimeout(ctx, discordAckTimeout)
+	defer ackCancel()
 
-	if err = d.hydrateChatCommand(ctx, chatCommand); err != nil {
-		logger.ErrorContext(ctx, "hydration error", tint.Err(err))
-		return nil, fmt.Errorf("error hydrating chat_command: %w", err)
+	reportingDiscordUser := getDiscordUser(i)
+
+	user, _, err := d.GetOrCreateUser(ctx, *reportingDiscordUser)
+	if err != nil {
+		logger.ErrorContext(ctx, "error getting reporting user", tint.Err(err))
+		return fmt.Errorf("error getting reporting user: %w", err)
 	}
+	logger = logger.With("user", user)
+	ctx = WithLogger(ctx, logger)
+
+	if user.Ignored {
+		logger.Warn("ignoring feedback from blocked user")
+		return nil
+	}
+
 	config := d.RuntimeConfig()
-	logger.InfoContext(ctx, fmt.Sprintf("custom ID: %#v", customID))
 
 	// Clicking the "Other" button responds to the interaction with a text
 	// input modal, which creates a UserFeedback entry on submission,
 	// whereas the other buttons create a UserFeedback record immediately
 	if customID.ReportType == UserFeedbackOther {
+		if !config.FeedbackEnabled {
+			logger.Warn("feedback currently disabled, skipping modal")
+			return nil
+		}
 		modalLabel := truncate(
 			config.FeedbackModalInputLabel,
 			discordModalInputLabelMaxLength,
@@ -2364,107 +2249,139 @@ func (d *DisConcierge) interactionResponseToMessageComponent(
 			"modal response",
 			"modal_response", modalResponse,
 		)
-		return modalResponse, nil
+		return handler.Respond(ackCtx, modalResponse, discordgo.WithContext(ackCtx))
 	}
 
-	if chatCommand.hasPrivateFeedback() {
-		userReport := UserFeedback{
-			ChatCommandID: &chatCommand.ID,
-			UserID:        &chatCommand.UserID,
-			Type:          string(customID.ReportType),
-			Description:   feedbackTypeDescription[customID.ReportType],
-			CustomID:      customID.ID,
-		}
-		logger.Info(fmt.Sprintf("created new feedback: %#v", userReport))
-		err = chatCommand.newDMReport(
+	var chatCommand ChatCommand
+	rv := d.db.Where("custom_id = ?", customID.ID).Omit("User").Last(&chatCommand)
+	if rv.Error != nil {
+		logger.ErrorContext(
 			ctx,
-			d.writeDB,
-			&userReport,
+			"error finding chat_command for the given custom_id",
+			tint.Err(rv.Error),
+			"custom_id", customID.ID,
 		)
-		go d.notifyDiscordUserFeedback(context.Background(), *chatCommand, userReport)
-		if err != nil {
-			logger.ErrorContext(
-				ctx,
-				"error creating user report",
-				tint.Err(err),
-				"user_report", structToSlogValue(userReport),
-				"discord_message", structToSlogValue(chatCommand),
-			)
-			return nil, nil
-		}
-		return &discordgo.InteractionResponse{
-			Type: discordgo.InteractionResponseDeferredMessageUpdate,
-		}, nil
-	}
-
-	var reportingUser *User
-
-	reportingDiscordUser := getDiscordUser(i)
-
-	if reportingDiscordUser.ID == chatCommand.UserID {
-		logger.InfoContext(
-			ctx,
-			"reporting user is the same user that triggered the command",
+		return fmt.Errorf(
+			"error finding chat_command for custom_id '%s': %w",
+			customID.ID, rv.Error,
 		)
-		reportingUser = chatCommand.User
-	} else {
-		logger.WarnContext(
-			ctx,
-			"different user reporting feedback",
-			"command_user_id", chatCommand.UserID,
-			"reporting_user_id", reportingDiscordUser.ID,
-			"reporting_username", reportingDiscordUser.Username,
-			"reporting_global_name", reportingDiscordUser.GlobalName,
-		)
-		reportingUser, _, err = d.GetOrCreateUser(ctx, *reportingDiscordUser)
-		if err != nil {
-			logger.ErrorContext(
-				ctx,
-				"error getting reporting user",
-				tint.Err(err),
-			)
-			return nil, fmt.Errorf("error getting reporting user: %w", err)
-		}
 	}
 
-	previousFeedback, err := chatCommand.userReportExists(
-		ctx,
-		d.db,
-		reportingUser.ID,
-		customID.ReportType,
-	)
-	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-		logger.ErrorContext(ctx, "error getting previous feedback", tint.Err(err))
-		return nil, fmt.Errorf("error getting previous feedback: %w", err)
-	}
-	if previousFeedback > 0 {
-		logger.WarnContext(ctx, "duplicate feedback, ignoring")
-		return &discordgo.InteractionResponse{
-			Type: discordgo.InteractionResponseDeferredMessageUpdate,
-		}, nil
-	}
 	userReport := UserFeedback{
 		ChatCommandID: &chatCommand.ID,
-		UserID:        &reportingUser.ID,
+		UserID:        &user.ID,
 		Type:          string(customID.ReportType),
 		Description:   feedbackTypeDescription[customID.ReportType],
 		CustomID:      customID.ID,
 	}
-	if _, err = d.writeDB.Create(&userReport); err != nil {
+
+	if !config.FeedbackEnabled {
+		logger.Warn("feedback currently disabled, saving report but will not update the interaction")
+		if _, err = d.writeDB.Create(context.TODO(), &userReport); err != nil {
+			logger.ErrorContext(ctx, "error creating user feedback", tint.Err(err))
+			return fmt.Errorf("error creating user feedback: %w", err)
+		}
+		return nil
+	}
+
+	userPreviouslySubmitted, err := UserPreviouslySubmittedFeedback(
+		ctx,
+		d.db,
+		user.ID,
+		chatCommand.ID,
+		customID.ReportType,
+	)
+
+	if err != nil {
+		logger.ErrorContext(ctx, "error getting user feedback info", tint.Err(err))
+		return fmt.Errorf("error getting user feedback info: %w", err)
+	}
+
+	if userPreviouslySubmitted {
+		logger.Warn("user already used this feedback button, ignoring")
+		return handler.Respond(
+			ackCtx,
+			&discordgo.InteractionResponse{
+				Type: discordgo.InteractionResponseDeferredMessageUpdate,
+			},
+			discordgo.WithContext(ackCtx),
+		)
+	}
+
+	if _, err = d.writeDB.Create(context.TODO(), &userReport); err != nil {
 		logger.ErrorContext(ctx, "error creating user feedback", tint.Err(err))
-		return nil, fmt.Errorf("error creating user feedback: %w", err)
+		return fmt.Errorf("error creating user feedback: %w", err)
 	}
 	logger.InfoContext(ctx, "responding to button interaction")
-	go d.notifyDiscordUserFeedback(context.Background(), *chatCommand, userReport)
-	return &discordgo.InteractionResponse{
-		Type: discordgo.InteractionResponseDeferredMessageUpdate,
-	}, nil
+
+	// if for whatever reason we can't get the original content of the message,
+	// we'll just update the interaction with the default response - otherwise,
+	// we'd end up wiping out the message content with the update
+	var content string
+	if i.Message != nil {
+		content = i.Message.Content
+	}
+	if content == "" && chatCommand.Response != nil {
+		content = *chatCommand.Response
+	}
+	defer func() {
+		nctx, ncancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer ncancel()
+		d.notifyDiscordUserFeedback(nctx, chatCommand, userReport, *user)
+	}()
+
+	if content == "" {
+		logger.Error("no content to update")
+		err = handler.Respond(
+			ackCtx,
+			&discordgo.InteractionResponse{
+				Type: discordgo.InteractionResponseDeferredMessageUpdate,
+			},
+			discordgo.WithContext(ackCtx),
+		)
+		if err != nil {
+			logger.ErrorContext(ctx, "error editing interaction", tint.Err(err))
+		}
+
+		return err
+	}
+
+	feedbackCounts, err := GetFeedbackCounts(ctx, d.db, chatCommand.ID)
+	if err != nil {
+		logger.Error("error getting feedback counts", tint.Err(err))
+		return err
+	}
+
+	buttonComponents := chatCommand.discordUserFeedbackComponents(feedbackCounts)
+
+	err = handler.Respond(
+		ctx,
+		&discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseUpdateMessage,
+			Data: &discordgo.InteractionResponseData{
+				Content:    content,
+				Components: buttonComponents,
+			},
+		},
+	)
+	if err != nil {
+		logger.ErrorContext(ctx, "error editing interaction", tint.Err(err))
+		return err
+	}
+
+	return nil
 }
 
+// notifyDiscordUserFeedback sends a discord message to the configured
+// notification channel, reporting the given user feedback, with links to
+// the UserFeedback and ChatCommand entries in the admin interface.
+// Has no effect if [RuntimeConfig.DiscordNotificationChannelID] is not
+// set, or if `RuntimeConfig.DiscordGatewayEnabled` is false.
 func (d *DisConcierge) notifyDiscordUserFeedback(
 	ctx context.Context,
 	c ChatCommand,
 	report UserFeedback,
+	user User,
 ) {
 	logger, ok := ContextLogger(ctx)
 	if !ok || logger == nil {
@@ -2472,7 +2389,7 @@ func (d *DisConcierge) notifyDiscordUserFeedback(
 		ctx = WithLogger(ctx, logger)
 	}
 
-	config := c.handler.Config()
+	config := d.RuntimeConfig()
 
 	channelID := config.DiscordNotificationChannelID
 	if channelID == "" {
@@ -2480,67 +2397,46 @@ func (d *DisConcierge) notifyDiscordUserFeedback(
 		return
 	}
 
-	if !d.RuntimeConfig().DiscordGatewayEnabled {
+	if !config.DiscordGatewayEnabled {
 		logger.Warn("discord gateway enabled, will not send feedback to channel")
 	}
 	feedbackType := FeedbackButtonType(report.Type)
-	if feedbackType == UserFeedbackReset {
-		return
-	}
-	sb := strings.Builder{}
 
+	feedbackURL := fmt.Sprintf(
+		"%s%s%d",
+		d.config.API.ExternalURL,
+		adminPathUserFeedback,
+		report.ID,
+	)
+	chatCommandURL := fmt.Sprintf(
+		"%s%s%d",
+		d.config.API.ExternalURL,
+		adminPathChatCommand,
+		*report.ChatCommandID,
+	)
+
+	var notificationMessage string
 	switch feedbackType {
 	case UserFeedbackGood:
-		sb.WriteString(
-			fmt.Sprintf("# Received feedback: **%s**\n", report.Description),
+		notificationMessage = fmt.Sprintf(
+			":thumbsup: `%s` reported [feedback: **%s**](%s) for [ChatCommand %d](%s)",
+			user.GlobalName,
+			report.Description,
+			feedbackURL,
+			*report.ChatCommandID,
+			chatCommandURL,
 		)
+
 	default:
-		sb.WriteString(
-			fmt.Sprintf("# :warning: Received feedback: **%s**\n", report.Description),
+		notificationMessage = fmt.Sprintf(
+			":thumbsdown: `%s` reported [feedback: **%s**](%s) for [ChatCommand %d](%s)\n",
+			user.GlobalName,
+			report.Description,
+			feedbackURL,
+			*report.ChatCommandID,
+			chatCommandURL,
 		)
-	}
 
-	if feedbackType == UserFeedbackOther {
-		sb.WriteString("\n## User Input\n")
-		sb.WriteString("```\n")
-		sb.WriteString(strings.ReplaceAll(report.Detail, "`", " "))
-		sb.WriteString("\n```\n")
-	}
-	sb.WriteString("## User\n")
-	sb.WriteString(fmt.Sprintf("- global_name: `%s`\n", c.User.GlobalName))
-	sb.WriteString(fmt.Sprintf("- username: `%s`\n", c.User.Username))
-	sb.WriteString(fmt.Sprintf("- id: `%s`\n", c.User.ID))
-
-	sb.WriteString("## ChatCommand\n")
-	sb.WriteString(fmt.Sprintf("- id: `%d`\n", c.ID))
-	sb.WriteString(fmt.Sprintf("- interaction_id: `%s`\n", c.InteractionID))
-	sb.WriteString(fmt.Sprintf("- custom_id: `%s`\n", c.CustomID))
-	sb.WriteString(fmt.Sprintf("- context: `%s`\n", c.CommandContext))
-	sb.WriteString(
-		fmt.Sprintf(
-			"- completion tokens: `%d`\n",
-			c.UsageCompletionTokens,
-		),
-	)
-	sb.WriteString(fmt.Sprintf("- prompt tokens: `%d`\n", c.UsagePromptTokens))
-	sb.WriteString(fmt.Sprintf("- total tokens: `%d`\n", c.UsageTotalTokens))
-
-	sb.WriteString("### Prompt\n")
-	sb.WriteString("```\n")
-	sb.WriteString(strings.ReplaceAll(c.Prompt, "`", " "))
-	sb.WriteString("\n```\n")
-
-	sb.WriteString("### Response\n")
-	var promptResponse string
-	if c.Response != nil {
-		promptResponse = *c.Response
-	}
-	if promptResponse == "" {
-		sb.WriteString("(no response)")
-	} else {
-		sb.WriteString("```\n")
-		sb.WriteString(strings.ReplaceAll(promptResponse, "`", " "))
-		sb.WriteString("\n```\n")
 	}
 
 	sendCtx, sendCancel := context.WithTimeout(
@@ -2551,7 +2447,7 @@ func (d *DisConcierge) notifyDiscordUserFeedback(
 
 	err := d.discord.channelMessageSend(
 		channelID,
-		sb.String(),
+		notificationMessage,
 		discordgo.WithContext(sendCtx),
 		discordgo.WithRetryOnRatelimit(false),
 		discordgo.WithRestRetries(2),
@@ -2598,7 +2494,7 @@ func (d *DisConcierge) runClearCommand(
 	started := time.Now()
 	clearRec.StartedAt = &started
 	config := handler.Config()
-	if _, dbErr := d.writeDB.Create(clearRec); dbErr != nil {
+	if _, dbErr := d.writeDB.Create(context.TODO(), clearRec); dbErr != nil {
 		logger.ErrorContext(ctx, "error creating clear command", tint.Err(dbErr))
 		wg.Add(1)
 		go func() {
@@ -2632,8 +2528,7 @@ func (d *DisConcierge) runClearCommand(
 			finishedAt := time.Now()
 			// TODO add a test to make sure finished_at gets set in this scenario
 			if _, err := d.writeDB.Updates(
-				clearRec,
-				map[string]any{
+				context.TODO(), clearRec, map[string]any{
 					columnClearCommandResponse:   &responseMsg,
 					columnClearCommandFinishedAt: &finishedAt,
 				},
@@ -2693,378 +2588,219 @@ func (*DisConcierge) handleRecover(ctx context.Context, rc any) {
 	)
 }
 
-// InteractionHandler defines the interface for handling Discord interactions.
-// It provides methods for responding to interactions, retrieving responses,
-// editing messages, and managing interaction lifecycle.
-//
-// Implementations of this interface are responsible for handling different
-// types of Discord interactions, such as commands, components, and modals.
-type InteractionHandler interface {
-	// Respond sends an initial response to a Discord interaction.
-	Respond(ctx context.Context, i *discordgo.InteractionResponse) error
-
-	// GetResponse retrieves the current response for an interaction.
-	GetResponse(ctx context.Context) (*discordgo.Message, error)
-
-	// Edit modifies an existing interaction response.
-	Edit(
-		ctx context.Context,
-		e *discordgo.WebhookEdit,
-		opts ...discordgo.RequestOption,
-	) (*discordgo.Message, error)
-
-	// Delete removes an interaction response.
-	Delete(ctx context.Context, opts ...discordgo.RequestOption)
-
-	// GetInteraction returns the original InteractionCreate event.
-	GetInteraction() *discordgo.InteractionCreate
-
-	// InteractionReceiveMethod returns the method used to receive the
-	// interaction (webhook or gateway).
-	InteractionReceiveMethod() DiscordInteractionReceiveMethod
-
-	// Logger returns the logger associated with this handler.
-	Logger() *slog.Logger
-
-	// Config returns the command options for this handler.
-	Config() CommandOptions
-}
-
-// GatewayHandler implements [InteractionHandler] when receiving interactions
-// via the discord websocket gateway.
-type GatewayHandler struct {
-	session     DiscordSessionHandler
-	interaction *discordgo.InteractionCreate
-	logger      *slog.Logger
-	config      CommandOptions
-	mu          *sync.RWMutex
-}
-
-func (GatewayHandler) InteractionReceiveMethod() DiscordInteractionReceiveMethod {
-	return discordInteractionReceiveMethodGateway
-}
-
-func (w GatewayHandler) Config() CommandOptions {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-	return w.config
-}
-
-func (w GatewayHandler) ChannelMessageSendReply(
-	channelID string,
-	content string,
-	reference *discordgo.MessageReference,
-	options ...discordgo.RequestOption,
-) (*discordgo.Message, error) {
-	msg, err := w.session.ChannelMessageSendReply(
-		channelID, content, reference, options...,
-	)
-	if err != nil {
-		w.logger.Error(
-			"error sending message reply",
-			tint.Err(err),
-			"channel_id", channelID,
-			"content", content,
-			"reference", reference,
-		)
-	} else {
-		w.logger.Error(
-			"sent message reply",
-			"channel_id", channelID,
-			"content", content,
-			"reference", reference,
-			"msg", msg,
-		)
-	}
-	return msg, err
-}
-
-func (w GatewayHandler) Respond(
-	ctx context.Context,
-	response *discordgo.InteractionResponse,
-) error {
-	err := w.session.InteractionRespond(w.interaction.Interaction, response)
-	if err != nil {
-		w.logger.ErrorContext(ctx, "error responding to interaction", tint.Err(err))
-	} else {
-		w.logger.InfoContext(ctx, "responded to interaction")
-	}
-	return err
-}
-
-func (w GatewayHandler) GetResponse(ctx context.Context) (
-	*discordgo.Message,
-	error,
+func (d *DisConcierge) getLogger(ctx context.Context) (
+	context.Context,
+	*slog.Logger,
 ) {
-	msg, err := w.session.InteractionResponse(
-		w.interaction.Interaction,
-	)
-	if err != nil {
-		w.logger.ErrorContext(ctx, "error getting interaction", tint.Err(err))
-	} else {
-		w.logger.InfoContext(ctx, "got interaction response", "message", msg)
+	logger, ok := ContextLogger(ctx)
+	if logger == nil || !ok {
+		logger = d.logger
+		ctx = WithLogger(ctx, logger)
 	}
-	return msg, err
+	return ctx, logger
 }
 
-func (w GatewayHandler) GetInteraction() *discordgo.InteractionCreate {
-	return w.interaction
-}
-
-func (w GatewayHandler) Edit(
-	ctx context.Context,
-	wh *discordgo.WebhookEdit,
-	opts ...discordgo.RequestOption,
-) (*discordgo.Message, error) {
-	msg, err := w.session.InteractionResponseEdit(
-		w.interaction.Interaction,
-		wh,
-		opts...,
-	)
-	if err != nil {
-		w.logger.ErrorContext(ctx, "error editing interaction response", tint.Err(err))
-	} else {
-		w.logger.InfoContext(ctx, "edited interaction")
-	}
-	return msg, err
-}
-
-func (w GatewayHandler) Delete(ctx context.Context, opts ...discordgo.RequestOption) {
-	err := w.session.InteractionResponseDelete(
-		w.interaction.Interaction,
-		opts...,
-	)
-	if err != nil {
-		w.logger.ErrorContext(ctx, "error deleting interaction response", tint.Err(err))
-	}
-}
-
-func (w GatewayHandler) Logger() *slog.Logger {
-	return w.logger
-}
-
-func newInteractionLog(
-	i *discordgo.InteractionCreate,
-	u *discordgo.User,
-	handler InteractionHandler,
-) (*InteractionLog, error) {
-	p, err := json.Marshal(i)
-	if err != nil {
-		return nil, fmt.Errorf("error marshaling interaction: %w", err)
-	}
-
-	interactionLog := &InteractionLog{
-		InteractionID: i.ID,
-		Type:          i.Type.String(),
-		UserID:        u.ID,
-		Username:      u.String(),
-		GuildID:       i.GuildID,
-		ChannelID:     i.ChannelID,
-		Context:       i.Context.String(),
-		Payload:       string(p),
-		Method:        handler.InteractionReceiveMethod(),
-	}
-	return interactionLog, nil
-}
-
-// handleInteraction processes incoming Discord interactions for the DisConcierge bot.
+// handleDiscordMessage processes incoming Discord messages that mention the
+// bot or are in response to a bot interaction.
 //
-// This function is responsible for handling various types of Discord interactions,
-// including application commands (slash commands), message components, and modal submits.
-// It manages the flow of interaction processing, from initial reception to final response.
+// This method is typically called as a goroutine for each new message
+// received through the Discord gateway.
+// It filters and handles messages that are relevant to the bot, such as direct
+// mentions or replies to bot messages.
 //
-// Parameters:
-//   - ctx: A context.Context for managing the lifecycle of the interaction handling.
-//   - handler: An InteractionHandler interface that provides methods for
-//     responding to the interaction.
+// Messages which are replies to a known bot interaction are
+// saved as a DiscordMessage.
 //
-// The function performs the following main tasks:
-//  1. Logs the incoming interaction details.
-//  2. Creates an InteractionLog record in the database.
-//  3. Handles different interaction types:
-//     - InteractionPing: Responds with a pong.
-//     - InteractionModalSubmit: Processes modal submissions (e.g., feedback forms).
-//     - InteractionMessageComponent: Handles button clicks and other component interactions.
-//     - InteractionApplicationCommand: Processes slash commands like /chat, /private, /clear, etc.
-//  4. For application commands, it:
-//     - Acknowledges the interaction if necessary.
-//     - Retrieves or creates a User record associated with the interaction.
-//     - Processes specific commands (/chat, /private, /clear).
-//     - Manages command queuing and execution.
-//  5. Handles errors and updates interaction states accordingly.
+// If the message is a reply to a known bot interaction, or mentions the
+// bot, it's saved as DiscordMessage.
 //
-// The function uses goroutines for concurrent processing of certain tasks,
-// such as database operations and long-running command executions.
+// If the message is a reply to a known bot interaction, and the associated
+// [ChatCommand.DiscordMessageID] is empty, it will be set to the referenced
+// interaction message ID.
 //
-// Note: This function is central to the bot's operation and integrates various
-// components like user management, command processing, and Discord API interactions.
-func (d *DisConcierge) handleInteraction(
-	ctx context.Context,
-	handler InteractionHandler,
-) {
-	interaction := handler.GetInteraction()
-	logger := handler.Logger()
+// If the message isn't a reply to a bot interaction, and mentions ONLY
+// the bot, the bot will reply with a greeting message and example slash
+// command usage.
+// This greeting message is only sent if the user doesn't have [User.Ignored]
+// set, and if the user doesn't already have a [userCommandWorker] running.
+// [userCommandWorker] will only reply to the first message it receives
+// while it's running, so at minimum once every two minutes (this is to
+// prevent spamming @mentions at the bot).
+func (d *DisConcierge) handleDiscordMessage(ctx context.Context, m *discordgo.MessageCreate) {
+	ctx, logger := d.getLogger(ctx)
 
-	i := handler.GetInteraction()
-	discordUser := getDiscordUser(i)
-	if discordUser == nil {
-		logger.ErrorContext(
+	logger.DebugContext(ctx, "saw message", "message", structToSlogValue(m))
+
+	if m.MentionEveryone {
+		logger.DebugContext(
 			ctx,
-			"no user found in interaction",
-			"interaction", structToSlogValue(i),
+			"ignoring message mentioning everyone",
+			"message",
+			structToSlogValue(m),
 		)
 		return
 	}
 
-	logger = logger.With(slog.Group("interaction", interactionLogAttrs(*i)...))
-	ctx = WithLogger(ctx, logger)
-	logger.InfoContext(ctx, "received new interaction", "user", structToSlogValue(discordUser))
-
-	interactionLog, err := newInteractionLog(i, discordUser, handler)
-	if err != nil {
-		logger.ErrorContext(ctx, "error marshaling interaction", tint.Err(err))
+	if len(m.Mentions) == 0 && m.ReferencedMessage == nil {
+		logger.DebugContext(
+			ctx,
+			"ignoring message with no mentions or interaction",
+			"message",
+			structToSlogValue(m),
+		)
+		return
 	}
+
+	user := m.Author
+	if user == nil && m.Member != nil {
+		user = m.Member.User
+	}
+	if user == nil {
+		logger.WarnContext(ctx, "couldn't find user in discord message")
+		return
+	}
+
+	if user.Bot || user.ID == d.config.Discord.ApplicationID {
+		logger.DebugContext(ctx, "ignoring message from bot", "user", user)
+		return
+	}
+
+	dm := NewDiscordMessage(m.Message)
+
+	mentionsBot := messageMentionsUser(
+		m.Message,
+		d.config.Discord.ApplicationID,
+	)
+
+	// if the bot isn't mentioned, and this isn't a reply to one of the bot's
+	// own interactions, we ignore the message entirely
+	if dm.InteractionID == "" && !mentionsBot {
+		logger.Debug("no interaction, no mentions, ignoring")
+		return
+	}
+
+	// that leaves us with these possibilities, where we save the message for each:
+	// - the reply is to a known bot interaction (we don't respond)
+	// - the message mentions the bot and others (we don't respond)
+	// - the message mentions ONLY the bot  (we potentially respond)
+	//
+	// If we 'potentially' respond, we enqueue the user worker and send the
+	// message to replyCh. The worker tracks whether it's received a message
+	// on that channel before. If it has, it ignores the message.
+	// This means the bot will respond in this way to a user at most
+	// once for the lifetime of the worker, so a minimum of 2 minutes.
+	// This prevents a user from spamming @mentions at the bot and hitting
+	// Discord rate limits.
 
 	wg := &sync.WaitGroup{}
 	defer wg.Wait()
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if _, createErr := d.writeDB.Create(interactionLog); createErr != nil {
-			logger.ErrorContext(ctx, "error logging interaction", tint.Err(createErr))
-		}
-	}()
-
-	if discordUser.Bot {
-		logger.WarnContext(ctx, "user is bot, ignoring", "user", discordUser)
-		return
-	}
-
-	switch interaction.Type {
-	case discordgo.InteractionPing:
-		_ = handler.Respond(
-			ctx, &discordgo.InteractionResponse{
-				Type: discordgo.InteractionResponsePong,
-			},
-		)
-	case discordgo.InteractionModalSubmit:
-		if rv := d.interactionResponseToSubmittedModal(ctx, i); rv != nil {
-			_ = handler.Respond(ctx, rv)
-		}
-	case discordgo.InteractionMessageComponent:
-		rv, e := d.interactionResponseToMessageComponent(ctx, i)
-		if e != nil {
-			logger.ErrorContext(ctx, "error with component response", tint.Err(e))
-		}
-		if rv != nil {
-			if responseErr := handler.Respond(ctx, rv); responseErr != nil {
+	defer func() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := d.writeDB.Create(context.TODO(), &dm); err != nil {
 				logger.ErrorContext(
 					ctx,
-					"error responding to component interaction",
-					tint.Err(responseErr),
+					"error creating discord message log",
+					tint.Err(err),
+					"discord_message", dm,
+				)
+			} else {
+				logger.InfoContext(
+					ctx,
+					"created new discord_message mentioning bot",
+					"discord_message", dm,
 				)
 			}
-		}
-	case discordgo.InteractionApplicationCommand:
-		commandName := i.ApplicationCommandData().Name
+		}()
+	}()
 
-		u, _, e := d.GetOrCreateUser(ctx, *discordUser)
-
-		if e != nil {
-			logger.ErrorContext(ctx, "error getting user", tint.Err(e))
-
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				handler.Delete(ctx)
-			}()
-
-			return
-		}
-
-		logger = logger.With(slog.Group("user", userLogAttrs(*u)...))
-
-		// ignore any interactions from ignored users, or from
-		// non-priority users while the bot is paused
-		if u.Ignored || (d.paused.Load() && !u.Priority) {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				d.handleIgnoredUserCommand(ctx, handler, u, i)
-			}()
-
-			return
-		}
-
-		switch commandName {
-		case DiscordSlashCommandChat, DiscordSlashCommandPrivate:
-			if ackErr := handler.Respond(ctx, d.discord.ackResponse(commandName)); ackErr != nil {
-				logger.ErrorContext(ctx, "error acknowledging interaction", tint.Err(ackErr))
-				return
-			}
-
-			chatCommand, cmdErr := NewChatCommand(u, i)
-			if cmdErr != nil {
-				logger.ErrorContext(ctx, "error creating chat_command", tint.Err(cmdErr))
-			}
-			if chatCommand == nil {
-				logger.Warn("unexpected nil command")
-				return
-			}
-
-			chatCommand.handler = handler
-			if i.ApplicationCommandData().Name == DiscordSlashCommandPrivate {
-				chatCommand.Private = true
-			}
-			if _, createErr := d.writeDB.Create(chatCommand); createErr != nil {
-				chatCommand.finalizeWithError(ctx, d, createErr)
-				return
-			}
-
-			msg, respErr := handler.GetResponse(ctx)
-			if respErr != nil {
-				logger.Error("error getting interaction response", tint.Err(respErr))
-				chatCommand.finalizeWithError(ctx, d, respErr)
-				return
-			}
-
-			chatCommand.Acknowledged = true
-			if chatCommand.DiscordMessageID == "" && msg != nil {
-				chatCommand.DiscordMessageID = msg.ID
-			}
-
-			if _, updErr := d.writeDB.Updates(
-				chatCommand,
-				map[string]any{
-					columnChatCommandAcknowledged:     chatCommand.Acknowledged,
-					columnChatCommandDiscordMessageID: chatCommand.DiscordMessageID,
-				},
-			); updErr != nil {
-				logger.ErrorContext(ctx, "error updating chat_command", tint.Err(updErr))
-				chatCommand.finalizeWithError(ctx, d, updErr)
-				return
-			}
-
-			logger = logger.With(
-				slog.Group("chat_command", chatCommandLogAttrs(*chatCommand)...),
+	switch {
+	case dm.InteractionID == "" && mentionsBot:
+		mentionCount := len(m.Mentions)
+		if mentionCount != 1 {
+			logger.InfoContext(
+				ctx,
+				"multiple mentions, will not respond to message",
 			)
-			ctx = WithLogger(ctx, logger)
+			return
+		}
+		u, _, err := d.GetOrCreateUser(ctx, *user)
+		if err != nil {
+			logger.ErrorContext(ctx, "error getting or creating user", tint.Err(err))
+			return
+		}
+		if u.Ignored {
+			logger.WarnContext(
+				ctx,
+				"ignoring direct message from ignored user",
+				"user", u,
+			)
+			return
+		}
+	case dm.InteractionID != "":
+		chatCommand := ChatCommand{}
 
-			chatCommand.enqueue(ctx, d)
-		case DiscordSlashCommandClear:
-			clearRec := NewUserClearCommand(d, u, i)
-			clearRec.handler = handler
-			if ackErr := handler.Respond(ctx, d.discord.ackResponse(commandName)); ackErr != nil {
-				logger.ErrorContext(ctx, "error acknowledging interaction", tint.Err(ackErr))
-				clearRec.State = ClearCommandStateFailed
-				if _, dbErr := d.writeDB.Create(clearRec); dbErr != nil {
-					logger.Error("error saving clear command", tint.Err(dbErr))
-				}
-				return
+		err := d.db.Select("id", columnChatCommandInteractionID).Take(
+			&chatCommand,
+			"interaction_id = ?", dm.InteractionID,
+		).Error
+		if err != nil {
+			switch {
+			case errors.Is(err, gorm.ErrRecordNotFound):
+				logger.InfoContext(
+					ctx,
+					"no ChatCommand found for interaction",
+					"interaction_id", dm.InteractionID,
+				)
+			default:
+				logger.ErrorContext(ctx, "error finding chat command", tint.Err(err))
 			}
-			clearRec.Acknowledged = true
-			d.runClearCommand(ctx, handler, clearRec)
+			return
+		}
+
+		logger.DebugContext(
+			ctx,
+			fmt.Sprintf(
+				"chat_command.interaction_id=%#v discord_message.interaction_id=%#v",
+				chatCommand.InteractionID,
+				dm.InteractionID,
+			),
+		)
+		if chatCommand.InteractionID != dm.InteractionID {
+			logger.WarnContext(
+				ctx,
+				fmt.Sprintf(
+					"why do these not match: %s / %s",
+					chatCommand.InteractionID,
+					dm.InteractionID,
+				),
+			)
+			return
+		}
+		logger.InfoContext(
+			ctx,
+			"found matching message",
+			"discord_message",
+			dm,
+		)
+		if chatCommand.DiscordMessageID == "" {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if _, updErr := d.writeDB.Update(
+					context.TODO(),
+					&chatCommand,
+					columnChatCommandDiscordMessageID,
+					dm.ReferencedMessageID,
+				); updErr != nil {
+					logger.Error(
+						"error updating chat_command with new discord_message_id",
+						tint.Err(updErr),
+					)
+				}
+			}()
 		}
 	}
 }
@@ -3100,7 +2836,7 @@ func (d *DisConcierge) handleIgnoredUserCommand(
 			chatCommand.Private = true
 		}
 
-		if _, e := d.writeDB.Create(chatCommand); e != nil {
+		if _, e := d.writeDB.Create(context.TODO(), chatCommand); e != nil {
 			logger.ErrorContext(ctx, "error saving chat_command record", tint.Err(e))
 		} else {
 			logger.InfoContext(
@@ -3114,7 +2850,7 @@ func (d *DisConcierge) handleIgnoredUserCommand(
 		clearCmd.handler = handler
 
 		clearCmd.State = ClearCommandStateIgnored
-		if _, e := d.writeDB.Create(clearCmd); e != nil {
+		if _, e := d.writeDB.Create(context.TODO(), clearCmd); e != nil {
 			logger.ErrorContext(ctx, "error saving clear command", tint.Err(e))
 		} else {
 			logger.InfoContext(
@@ -3174,9 +2910,6 @@ func (d *DisConcierge) resumeChatCommand(
 	ctx context.Context,
 	c *ChatCommand,
 ) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	logger := c.handler.Logger()
 
 	logger = logger.With(
@@ -3211,6 +2944,7 @@ func (d *DisConcierge) resumeChatCommand(
 	defer func() {
 		if triggerResume {
 			if _, updErr := d.writeDB.UpdatesWhere(
+				context.TODO(),
 				&ChatCommand{},
 				map[string]any{columnChatCommandAttempts: c.Attempts + 1},
 				"id = ?",
@@ -3240,6 +2974,7 @@ func (d *DisConcierge) resumeChatCommand(
 		if tokenExpired {
 			logger.Warn("token expired on resume")
 			if _, updErr := d.writeDB.Update(
+				context.TODO(),
 				c,
 				columnChatCommandState,
 				ChatCommandStateExpired,
@@ -3262,6 +2997,7 @@ func (d *DisConcierge) resumeChatCommand(
 		return nil
 	case openai.RunStatusQueued:
 		triggerResume = true
+		logger.Info("resuming from queued", "chat_command", c)
 		c.enqueue(ctx, d)
 		return nil
 	}
@@ -3286,21 +3022,7 @@ func (d *DisConcierge) resumeChatCommand(
 	case ChatCommandStepListMessage:
 		triggerResume = true
 		logger.Info(fmt.Sprintf("resuming step: %s", c.Step))
-		go c.finalizeCompletedRun(ctx, d)
-	case ChatCommandStepFeedbackOpen:
-		if tokenExpired {
-			d.logger.InfoContext(
-				ctx,
-				"interaction expired, setting feedback as closed",
-				"chat_command", c,
-			)
-			c.finalizeExpiredButtons(ctx, d.writeDB)
-			return nil
-		}
-		logger.InfoContext(ctx, "starting button timer")
-
-		go d.chatCommandUnselectedButtonTimer(ctx, c)
-		return nil
+		c.finalizeCompletedRun(ctx, d)
 	}
 
 	return nil
@@ -3317,10 +3039,7 @@ func (d *DisConcierge) hydrateChatCommand(
 		logger = slog.Default()
 		ctx = WithLogger(ctx, logger)
 	}
-	logger.Info("hydrating!", "chat_command_id", c.ID)
-	if c.mu == nil {
-		c.mu = &sync.RWMutex{}
-	}
+	logger.Debug("hydrating chat_command", "chat_command_id", c.ID)
 
 	if c.handler == nil {
 		c.handler = d.getInteractionHandlerFunc(
@@ -3345,215 +3064,99 @@ func (d *DisConcierge) hydrateChatCommand(
 	return err
 }
 
-// chatCommandUnselectedButtonTimer waits until a minute before the Interaction's
-// token expires, and then removes any buttons from the interaction that
-// haven't been selected (selected buttons should already be disabled, but
-// should remain visible)
-func (d *DisConcierge) chatCommandUnselectedButtonTimer(
+// populateExpiredInteractionRunStatus attempts to retrieve the OpenAI
+// run results for any ChatCommand from the past 24 hours with an expired
+// discord interaction token (15 minutes), and updates the ChatCommand
+// with the result.
+// This is necessary to accurately track user token usage, because we may
+// incur cost from a ChatCommand that was interrupted for some reason,
+// and never had its OpenAI run status updated.
+func (d *DisConcierge) populateExpiredInteractionRunStatus(
 	ctx context.Context,
-	c *ChatCommand,
-) {
-	d.buttonTimersRunning.Add(1)
-	defer d.buttonTimersRunning.Add(-1)
-
-	logger, ok := ContextLogger(ctx)
-	if logger == nil || !ok {
-		logger = slog.Default()
-		ctx = WithLogger(ctx, logger)
+	pollInterval time.Duration,
+	maxInterval time.Duration,
+	maxErrors int,
+) error {
+	log, ok := ContextLogger(ctx)
+	if !ok || log == nil {
+		log = d.logger
+		ctx = WithLogger(ctx, log)
 	}
-	tokenExpires := time.UnixMilli(c.TokenExpires).UTC()
-	now := time.Now().UTC()
+	var chatCommands []ChatCommand
 
-	ctx, cancel := context.WithDeadline(ctx, tokenExpires)
-	defer cancel()
+	rv := d.db.WithContext(ctx).Where(
+		"run_id is not null "+
+			"AND run_id != ''"+
+			"AND run_status IN ? "+
+			"AND token_expires is not null "+
+			"AND token_expires > ? "+
+			"AND token_expires < ?",
+		[]openai.RunStatus{
+			openai.RunStatusInProgress,
+			openai.RunStatusQueued,
+			openai.RunStatus(""),
+		},
+		time.Now().Add(-24*time.Hour).UnixMilli(),
+		time.Now().Add(-15*time.Minute).UnixMilli(),
+	).Find(&chatCommands)
 
-	removeAt := c.removeButtonsAt()
+	if rv.Error != nil {
+		log.Error("error getting pending runs", tint.Err(rv.Error))
+		return rv.Error
+	}
+	if len(chatCommands) == 0 {
+		log.Info("no chat command runs to update")
+		return nil
+	}
+	log.InfoContext(ctx, fmt.Sprintf("found %d records to catch up", len(chatCommands)))
 
-	ds := removeAt.Sub(now)
-
-	if ds <= 0 {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-
-		c.finalizeExpiredButtons(ctx, d.writeDB)
-		return
+	g := new(errgroup.Group)
+	for _, c := range chatCommands {
+		g.Go(
+			func() error {
+				cmdCtx := WithLogger(ctx, log.With("chat_command", c))
+				updateErr := d.openai.pollUpdateRunStatus(
+					cmdCtx,
+					d.writeDB,
+					&c,
+					pollInterval,
+					maxInterval,
+					maxErrors,
+				)
+				if updateErr != nil {
+					return fmt.Errorf("error updating chat_command %d: %w", c.ID, updateErr)
+				}
+				return nil
+			},
+		)
 	}
 
-	if ds > 0 && ds < time.Minute {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		if err := c.removeUnusedFeedbackButtons(
-			ctx,
-			d.writeDB,
-		); err != nil {
-			logger.ErrorContext(ctx, "error removing unselected buttons", tint.Err(err))
-		}
-		return
+	if err := g.Wait(); g != nil {
+		log.Error("error updating chat command runs", tint.Err(err))
+		return err
 	}
-
-	logger.InfoContext(
-		ctx,
-		fmt.Sprintf(
-			"scheduling buttons to be disabled at: %s",
-			removeAt.String(),
-		),
-		"remove_at", removeAt,
-		"remove_in", ds,
-	)
-	timer := time.NewTimer(ds)
-	defer func() {
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-				//
-			default:
-				//
-			}
-		}
-	}()
-
-	// periodically emit a countdown log
-	ticker := time.NewTicker(1 * time.Minute)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			logger.InfoContext(ctx, "context canceled, stopping timer to remove buttons")
-			return
-		case <-ticker.C:
-			timeRemaining := time.Until(removeAt)
-			logger.DebugContext(
-				ctx,
-				fmt.Sprintf("%s remaining until buttons disabled", timeRemaining),
-			)
-		case <-timer.C:
-			if err := c.removeUnusedFeedbackButtons(
-				ctx,
-				d.writeDB,
-			); err != nil {
-				logger.ErrorContext(ctx, "error removing unselected buttons", tint.Err(err))
-			}
-			return
-		}
-	}
+	return nil
 }
 
-//
-// func (d *DisConcierge) listenForUserCacheRefresh(ctx context.Context) {
-// 	if d.config.DatabaseType != dbTypePostgres {
-// 		return
-// 	}
-//
-// 	logger := d.logger.With(loggerNameKey, "user_cache_listener")
-//
-// 	config, err := pgxpool.ParseConfig(d.config.Database)
-// 	if err != nil {
-// 		logger.ErrorContext(ctx, "Error parsing database config", tint.Err(err))
-// 		return
-// 	}
-//
-// 	pool, err := pgxpool.NewWithConfig(ctx, config)
-//
-// 	defer pool.Close()
-//
-// 	// Start listening for notifications
-// 	conn, err := pool.Acquire(ctx)
-// 	if err != nil {
-// 		logger.ErrorContext(ctx, "Error acquiring connection", tint.Err(err))
-// 		return
-// 	}
-// 	defer conn.Release()
-//
-// 	_, err = conn.Exec(ctx, "LISTEN ?", d.dbNotifier.UserCacheChannelName())
-// 	if err != nil {
-// 		logger.ErrorContext(ctx, "Error setting up listener", tint.Err(err))
-// 		return
-// 	}
-//
-// 	logger.InfoContext(ctx, "Started listening for user cache reload signals")
-//
-// 	for ctx.Err() == nil {
-// 		notification, e := conn.Conn().WaitForNotification(ctx)
-// 		if e != nil {
-// 			logger.ErrorContext(ctx, "Error waiting for notification", tint.Err(err))
-// 			time.Sleep(5 * time.Second) // Wait before retrying
-// 			continue
-// 		}
-//
-// 		if notification.Channel == d.dbNotifier.UserCacheChannelName() {
-// 			if notification.Payload == d.dbNotifier.ID() {
-// 				logger.InfoContext(ctx, "received NOTIFY from self, ignoring")
-// 				continue
-// 			}
-// 			logger.InfoContext(ctx, "Received notification to reload user cache")
-// 			select {
-// 			case d.triggerUserCacheRefreshCh <- true:
-// 				logger.Info("sent cache refresh signal from postgres listener")
-// 			case <-time.After(5 * time.Second):
-// 				logger.Warn("timed out sending config refresh signal")
-// 			}
-// 		}
-// 	}
-// }
-//
-// func (d *DisConcierge) listenForRuntimeConfigUpdates(ctx context.Context) {
-// 	if d.config.DatabaseType != dbTypePostgres {
-// 		return
-// 	}
-//
-// 	logger := d.logger.With(loggerNameKey, "runtime_config_listener")
-//
-// 	config, err := pgxpool.ParseConfig(d.config.Database)
-// 	if err != nil {
-// 		logger.ErrorContext(ctx, "Error parsing database config", tint.Err(err))
-// 		return
-// 	}
-//
-// 	pool, err := pgxpool.NewWithConfig(ctx, config)
-//
-// 	defer pool.Close()
-//
-// 	// Start listening for notifications
-// 	conn, err := pool.Acquire(ctx)
-// 	if err != nil {
-// 		logger.ErrorContext(ctx, "Error acquiring connection", tint.Err(err))
-// 		return
-// 	}
-// 	defer conn.Release()
-//
-// 	_, err = conn.Exec(
-// 		ctx,
-// 		"LISTEN ?",
-// 		d.dbNotifier.RuntimeConfigChannelName(),
-// 	)
-// 	if err != nil {
-// 		logger.ErrorContext(ctx, "Error setting up listener", tint.Err(err))
-// 		return
-// 	}
-//
-// 	logger.InfoContext(ctx, "Started listening for runtime config updates")
-//
-// 	for ctx.Err() == nil {
-// 		notification, e := conn.Conn().WaitForNotification(ctx)
-// 		if e != nil {
-// 			logger.ErrorContext(ctx, "Error waiting for notification", tint.Err(err))
-// 			time.Sleep(5 * time.Second) // Wait before retrying
-// 			continue
-// 		}
-//
-// 		if notification.Channel == d.dbNotifier.RuntimeConfigChannelName() {
-// 			if notification.Payload == d.dbNotifier.ID() {
-// 				logger.InfoContext(ctx, "received NOTIFY from self, ignoring")
-// 				continue
-// 			}
-// 			logger.InfoContext(ctx, "Received notification for runtime config update")
-// 			select {
-// 			case d.triggerRuntimeConfigRefreshCh <- true:
-// 				logger.Info("sent runtime config refresh signal from postgres listener")
-// 			case <-time.After(5 * time.Second):
-// 				logger.Warn("timed out sending config refresh signal")
-// 			}
-// 		}
-// 	}
-// }
+// isShutdownErr takes the given error and context, and returns a boolean
+// indicating whether the given error is ShutdownError, or whether the
+// provided context has been cancelled with ShutdownError.
+// This is to differentiate actual runtime errors (like a request timing out),
+// from context errors resulting from a shutdown signal being sent (in which
+// case we'd want to resume execution if we restart quickly enough)
+func isShutdownErr(ctx context.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	var shutdownErr *ShutdownError
+	if errors.As(err, &shutdownErr) {
+		return true
+	}
+	if ctx.Err() != nil {
+		causeErr := context.Cause(ctx)
+		if causeErr != nil && errors.As(causeErr, &shutdownErr) {
+			return true
+		}
+	}
+	return false
+}
