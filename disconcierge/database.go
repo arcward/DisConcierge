@@ -217,7 +217,9 @@ func (d *database) GetOrCreateUser(
 		log = slog.Default()
 	}
 
-	if user, cachedUser := d.userCache[u.ID]; cachedUser {
+	user, cachedUser := d.userCache[u.ID]
+
+	if cachedUser {
 		// FIXME This isn't particularly concurrency-safe, as the cached
 		//  record may be read by another goroutine while we're updating it.
 		log.InfoContext(ctx, "found existing user", "user", user)
@@ -247,10 +249,22 @@ func (d *database) GetOrCreateUser(
 			log.Error("error updating user", "user", user, tint.Err(err))
 		}
 		return user, false, nil
+	} else {
+		var existingUser User
+		err := d.db.Where("id = ?", u.ID).First(&existingUser).Error
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			log.Error("error getting user", "user_id", u.ID, tint.Err(err))
+			return nil, false, err
+		}
+		if existingUser.ID == u.ID {
+			log.Info("found existing user", "user", existingUser)
+			user = &existingUser
+			d.userCache[u.ID] = user
+			return user, false, nil
+		}
 	}
 
-	log.Info("creating new user", "user", u)
-	user, _ := NewUser(u)
+	user, _ = NewUser(u)
 	if dc != nil {
 		config := dc.RuntimeConfig()
 		user.UserChatCommandLimit6h = config.UserChatCommandLimit6h
