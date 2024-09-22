@@ -1550,3 +1550,39 @@ func isCI(t testing.TB) bool {
 	t.Helper()
 	return strings.ToLower(os.Getenv("CI")) == "true"
 }
+
+// TestGetOrCreateUser_CacheMiss tests the GetOrCreateUser method when the
+// provided user ID exists in the DB, but hasn't yet been added to the
+// bot's user cache
+func TestGetOrCreateUser_CacheMiss(t *testing.T) {
+	t.Parallel()
+
+	discordUser := newDiscordUser(t)
+	bot, _ := newDisConcierge(t)
+
+	user, isNew, err := bot.GetOrCreateUser(context.Background(), *discordUser)
+	require.NoError(t, err)
+	assert.True(t, isNew)
+	require.NotNil(t, user)
+
+	userID := user.ID
+
+	writeDB, ok := bot.writeDB.(*database)
+	require.True(t, ok)
+
+	_, ok = writeDB.userCache[userID]
+	require.True(t, ok)
+
+	delete(writeDB.userCache, userID)
+
+	_, ok = writeDB.userCache[userID]
+	assert.False(t, ok)
+
+	user, isNew, err = bot.GetOrCreateUser(context.Background(), *discordUser)
+	require.NoError(t, err)
+	assert.False(t, isNew)
+	assert.Equal(t, userID, user.ID)
+
+	_, ok = writeDB.userCache[userID]
+	assert.True(t, ok)
+}

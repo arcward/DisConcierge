@@ -443,7 +443,7 @@ func (d *DisConcierge) Run(parentCtx context.Context) error {
 			}
 			return e
 		} else {
-			logger.WarnContext(ctx, "init complete")
+			logger.Info("init complete")
 		}
 	}
 
@@ -1411,7 +1411,7 @@ func (d *DisConcierge) refreshUserCache(_ context.Context) {
 
 // shutdown attempts to gracefully shut down the bot, close HTTP servers, etc.
 func (d *DisConcierge) shutdown(ctx context.Context) error {
-	d.logger.WarnContext(ctx, "shutting down")
+	d.logger.InfoContext(ctx, "shutting down")
 	defer func() {
 		if d.eventShutdown != nil {
 			select {
