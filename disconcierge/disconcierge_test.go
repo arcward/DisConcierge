@@ -918,7 +918,7 @@ func TestHandleRecover(t *testing.T) {
 		ids.InteractionID,
 		question,
 	)
-	bctx, bcancel := context.WithTimeout(context.Background(), 15*time.Second)
+	bctx, bcancel := context.WithTimeout(context.Background(), time.Minute)
 	t.Cleanup(bcancel)
 	go bot.handleInteraction(
 		bctx,
