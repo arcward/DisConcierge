@@ -61,7 +61,7 @@ DC_QUEUE_SLEEP_PAUSED=5s
 
 DC_OPENAI_TOKEN=your-assistant-token
 DC_OPENAI_LOG_LEVEL=INFO
-DC_OPENAI_ASSISTANT_ID=asst_byFzFiJ9P4IEzrLEOigAuppS
+DC_OPENAI_ASSISTANT_ID=asst_foo
 
 # Discord bot config
 
@@ -96,10 +96,11 @@ DC_API_SSL_KEY_FILE=/etc/ssl/key.pem
 DC_API_SSL_TLS_MIN_VERSION=771
 DC_API_SECRET=your-api-secret
 DC_API_LOG_LEVEL=INFO
-DC_API_CORS_ALLOW_ORIGINS=https://127.0.0.1:5000,https://localhost:5000
-DC_API_CORS_ALLOW_METHODS=GET,POST,PUT,PATCH,DELETE,OPTIONS,HEAD
-DC_API_CORS_ALLOW_HEADERS=Origin,Content-Length,Content-Type,Accept,Authorization,X-Requested-With,Cache-Control,X-CSRF-Token,X-Request-ID
-DC_API_CORS_EXPOSE_HEADERS=Content-Type,Content-Length,Accept-Encoding,X-Request-ID,Location,ETag,Authorization,Last-Modified
+DC_API_CORS_ALLOW_ORIGINS=https://127.0.0.1:5000 https://localhost:5000
+DC_API_CORS_ALLOW_METHODS=GET POST PUT PATCH DELETE OPTIONS HEAD
+DC_API_CORS_ALLOW_HEADERS=Origin Content-Length Content-Type Accept Authorization X-Requested-With Cache-Control X-CSRF-Token X-Request-ID
+DC_API_CORS_EXPOSE_HEADERS=Content-Type Content-Length Accept-Encoding X-Request-ID Location ETag Authorization Last-Modified
+
 DC_API_CORS_ALLOW_CREDENTIALS=true
 DC_API_CORS_MAX_AGE=12h
 DC_API_READ_TIMEOUT=5s
