@@ -4,9 +4,12 @@ import (
 	"context"
 	"fmt"
 	"github.com/arcward/disconcierge/disconcierge"
+	"github.com/joho/godotenv"
 	"github.com/mitchellh/mapstructure"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"log"
 	"log/slog"
 	"os"
@@ -14,6 +17,7 @@ import (
 	"reflect"
 	"strings"
 	"syscall"
+	"testing"
 )
 
 var (
@@ -113,6 +117,17 @@ func Execute() {
 }
 
 func initConfig() {
+	if configFile == "" {
+		if err := godotenv.Load(); err != nil {
+			log.Println("No .env file found")
+		}
+	} else {
+		fmt.Println("loading env from file", configFile)
+		if err := godotenv.Load(configFile); err != nil {
+			log.Println("No .env file found")
+		}
+	}
+
 	viper.SetDefault("database", disconcierge.DefaultDatabase)
 	viper.SetDefault("database_type", disconcierge.DefaultDatabaseType)
 	viper.SetDefault(
@@ -123,12 +138,14 @@ func initConfig() {
 		"database_log_level",
 		disconcierge.DefaultDatabaseLogLevel.String(),
 	)
+	viper.SetDefault("external_url", "https://127.0.0.1:5000")
+	viper.SetDefault("development", false)
 
 	viper.SetDefault("runtime_config_ttl", disconcierge.DefaultRuntimeConfigTTL)
 	viper.SetDefault("user_cache_ttl", disconcierge.DefaultUserCacheTTL)
 
-	viper.SetDefault("log_level", disconcierge.DefaultLogLevel)
-	viper.SetDefault("api.log_level", disconcierge.DefaultAPILogLevel)
+	viper.SetDefault("log_level", disconcierge.DefaultLogLevel.String())
+	viper.SetDefault("api.log_level", disconcierge.DefaultAPILogLevel.String())
 
 	viper.SetDefault("startup_timeout", disconcierge.DefaultStartupTimeout)
 	viper.SetDefault("shutdown_timeout", disconcierge.DefaultShutdownTimeout)
@@ -165,10 +182,10 @@ func initConfig() {
 		"discord.gateway_intents",
 		disconcierge.DefaultDiscordGatewayIntent,
 	)
+	viper.SetDefault("discord.startup_message", disconcierge.DefaultDiscordStartupMessage)
 
 	// Discord: Webhook server
 	viper.SetDefault("discord.webhook_server.enabled", false)
-	viper.SetDefault("discord.webhook_server.listen_network", "tcp")
 	viper.SetDefault(
 		"discord.webhook_server.listen",
 		disconcierge.DefaultDiscordWebhookServerListen,
@@ -192,22 +209,27 @@ func initConfig() {
 	)
 	viper.SetDefault(
 		"discord.webhook_server.log_level",
-		disconcierge.DefaultDiscordWebhookLogLevel,
+		disconcierge.DefaultDiscordWebhookLogLevel.String(),
 	)
 
+	fatalErr := func(err error) {
+		if err != nil {
+			log.Fatalf("error: %v", err)
+		}
+	}
+
 	// Discord: Webhook server: SSL
-	viper.SetDefault("discord.webhook_server.ssl.cert", "")
-	viper.SetDefault("discord.webhook_server.ssl.key", "")
-	viper.SetDefault(
-		"discord.webhook_server.ssl.tls_min_version",
-		disconcierge.DefaultDiscordWebhookServerTLSminVersion,
-	)
+
+	fatalErr(viper.BindEnv("discord.webhook_server.ssl.cert_file"))
+	fatalErr(viper.BindEnv("discord.webhook_server.ssl.key_file"))
+	fatalErr(viper.BindEnv("discord.webhook_server.ssl.cert_pem"))
+	fatalErr(viper.BindEnv("discord.webhook_server.ssl.key_pem"))
+	fatalErr(viper.BindEnv("discord.webhook_server.ssl.tls_min_version"))
 
 	// API config
 	viper.SetDefault("api.listen", disconcierge.DefaultAPIListen)
-	viper.SetDefault("api.listen_network", "tcp")
 	viper.SetDefault("api.secret", "")
-	viper.SetDefault("api.development", false)
+
 	viper.SetDefault(
 		"api.session_max_age",
 		disconcierge.DefaultAPISessionMaxAge,
@@ -221,12 +243,12 @@ func initConfig() {
 	viper.SetDefault("api.idle_timeout", disconcierge.DefaultIdleTimeout)
 
 	// API: SSL config
-	viper.SetDefault("api.ssl.cert", "")
-	viper.SetDefault("api.ssl.key", "")
-	viper.SetDefault(
-		"api.ssl.tls_min_version",
-		disconcierge.DefaultUITLSMinVersion,
-	)
+	fatalErr(viper.BindEnv("api.external_url"))
+	fatalErr(viper.BindEnv("api.ssl.cert_file"))
+	fatalErr(viper.BindEnv("api.ssl.key_file"))
+	fatalErr(viper.BindEnv("api.ssl.cert_pem"))
+	fatalErr(viper.BindEnv("api.ssl.key_pem"))
+	fatalErr(viper.BindEnv("api.ssl.tls_min_version"))
 
 	// API: CORS config
 	viper.SetDefault(
@@ -251,26 +273,6 @@ func initConfig() {
 		disconcierge.DefaultAPICORSAllowCredentials,
 	)
 
-	home, err := os.UserHomeDir()
-	if err != nil {
-		panic(err)
-	}
-	viper.AddConfigPath(".")
-	viper.AddConfigPath(home)
-
-	viper.SetConfigType("yaml")
-	viper.SetConfigName("disconcierge.yaml")
-
-	if configFile != "" {
-		viper.SetConfigFile(configFile)
-		if err = viper.SafeWriteConfigAs(configFile); err != nil {
-			if _, ok := err.(viper.ConfigFileAlreadyExistsError); !ok {
-				panic(err)
-			}
-		}
-	}
-	configFile = viper.ConfigFileUsed()
-	fmt.Printf("config file: %s\n", configFile)
 	envPrefix := os.Getenv(disconcierge.EnvvarSetEnvPrefix)
 	if envPrefix == "" {
 		envPrefix = disconcierge.DefaultEnvPrefix
@@ -280,11 +282,6 @@ func initConfig() {
 	replacer := strings.NewReplacer(".", "_")
 	viper.SetEnvKeyReplacer(replacer)
 	viper.AutomaticEnv()
-	if err = viper.ReadInConfig(); err != nil {
-		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
-			panic(err)
-		}
-	}
 
 	// Convert values to correct types
 	viper.Set(
@@ -304,47 +301,59 @@ func initConfig() {
 		viper.GetStringSlice("api.cors.expose_headers"),
 	)
 
+	for k, v := range viper.AllSettings() {
+		log.Printf("config: %s: %v", k, v)
+	}
 	logLevelVar, err := levelStringToLevelVar(viper.GetString("log_level"))
 	if err != nil {
-		log.Fatalf("error parsing log level: %v", err)
+		log.Fatalf("error parsing log_level: %v", err)
 	}
 	viper.Set("log_level", logLevelVar)
 
 	logLevelVar, err = levelStringToLevelVar(viper.GetString("discord.log_level"))
 	if err != nil {
-		log.Fatalf("error parsing log level: %v", err)
+		log.Fatalf("error parsing discord log level: %v", err)
 	}
 	viper.Set("discord.log_level", logLevelVar)
 
 	logLevelVar, err = levelStringToLevelVar(viper.GetString("openai.log_level"))
 	if err != nil {
-		log.Fatalf("error parsing log level: %v", err)
+		log.Fatalf("error parsing openai log level: %v", err)
 	}
 	viper.Set("openai.log_level", logLevelVar)
 
 	logLevelVar, err = levelStringToLevelVar(viper.GetString("discord.discordgo_log_level"))
 	if err != nil {
-		log.Fatalf("error parsing log level: %v", err)
+		log.Fatalf("error parsing discordgo log level: %v", err)
 	}
 	viper.Set("discord.discordgo_log_level", logLevelVar)
 
 	logLevelVar, err = levelStringToLevelVar(viper.GetString("database_log_level"))
 	if err != nil {
-		log.Fatalf("error parsing log level: %v", err)
+		log.Fatalf("error parsing database log level: %v", err)
 	}
 	viper.Set("database_log_level", logLevelVar)
 
 	logLevelVar, err = levelStringToLevelVar(viper.GetString("api.log_level"))
 	if err != nil {
-		log.Fatalf("error parsing log level: %v", err)
+		log.Fatalf("error parsing api log level: %v", err)
 	}
 	viper.Set("api.log_level", logLevelVar)
 
 	logLevelVar, err = levelStringToLevelVar(viper.GetString("discord.webhook_server.log_level"))
 	if err != nil {
-		log.Fatalf("error parsing log level: %v", err)
+		log.Fatalf("error parsing webhook server log level: %v", err)
 	}
 	viper.Set("discord.webhook_server.log_level", logLevelVar)
+
+}
+
+func assertLogLevel(t testing.TB, expected slog.Level, v any) {
+	t.Helper()
+
+	lvl, ok := v.(*slog.LevelVar)
+	require.Truef(t, ok, "could not convert %#v (%T) to *slog.LevelVar", v, v)
+	assert.Equal(t, expected, lvl.Level())
 }
 
 func levelStringToLevelVar(lvl string) (*slog.LevelVar, error) {

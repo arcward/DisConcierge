@@ -8,9 +8,6 @@ interface AuthContextType {
     username: string | null;
     login: (username: string, password: string) => void;
     logout: () => void;
-
-    setupRequired: boolean | null;
-    setSetupRequired: (setupRequired: boolean) => void
 }
 
 
@@ -22,7 +19,6 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({children}) => {
     const history = useNavigate();
     const [username, setUsername] = useState<string | null>(null)
 
-    const [setupRequired, setSetupRequired] = useState<boolean | null>(null);
     const location = useLocation();
     const [isLoading, setIsLoading] = useState(true);
 
@@ -52,12 +48,6 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({children}) => {
         const initializeApp = async () => {
             setIsLoading(true);
             try {
-                // First, check if the app is set up
-                const setupResponse = await api.setupRequired();
-                setSetupRequired(setupResponse?.required ?? false);
-
-                // If the app is set up, then check authentication
-                if (!setupResponse?.required) {
                     try {
                         const authResponse = await api.loggedIn();
                         setIsAuthenticated(true);
@@ -66,10 +56,9 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({children}) => {
                         setIsAuthenticated(false);
                         setUsername(null);
                     }
-                }
+
             } catch (error) {
                 console.error('Error initializing app:', error);
-                setSetupRequired(false);
                 setIsAuthenticated(false);
                 setUsername(null);
             } finally {
@@ -84,20 +73,16 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({children}) => {
             return;
         }
 
-        if (setupRequired === true && location.pathname.indexOf('/setup') < 0) {
-            history('/setup');
-        } else if (setupRequired === false && !isAuthenticated && location.pathname.indexOf('/login') < 0) {
+         if (!isAuthenticated && location.pathname.indexOf('/login') < 0) {
             history('/login');
         }
-    }, [setupRequired, isAuthenticated, location.pathname, history, isLoading]);
+    }, [ isAuthenticated, location.pathname, history, isLoading]);
 
     const value = {
         isAuthenticated,
         username,
         login,
         logout,
-        setupRequired,
-        setSetupRequired,
         isLoading,
     };
     return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

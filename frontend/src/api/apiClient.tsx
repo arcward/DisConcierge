@@ -7,8 +7,8 @@ import axios, {AxiosError}                       from 'axios';
 import ChatCommand                               from '../models/ChatCommand';
 import DiscordMessage                            from '../models/DiscordMessage';
 import {UserFeedback, UserFeedbackResponse}      from '../models/UserFeedback';
-import ChatCommandDetail from '../models/ChatCommandDetail';
-import GatewayBot from '../models/GatewayBot';
+import ChatCommandDetail                         from '../models/ChatCommandDetail';
+import GatewayBot                                from '../models/GatewayBot';
 
 const DEFAULT_API_HOST = 'https://localhost';
 const DEFAULT_API_PORT = '5000';
@@ -49,19 +49,6 @@ const api = {
         const response = await apiClient.get('/api/discord/gateway/bot');
         return new GatewayBot(response.data);
     },
-    createAdminUser: async (userData: {
-        username: string;
-        password: string,
-        confirm_password: string,
-    }): Promise<void> => {
-        await apiClient.post('/setup', userData);
-    },
-    setupRequired: async (): Promise<{ required: boolean }> => {
-        const response = await apiClient.get('/setup/status');
-        return response.data;
-    },
-
-
     healthcheck: async (): Promise<HealthCheck> => {
         const response = await apiClient.get('/healthz');
         const t = new HealthCheck(response.data);
@@ -89,12 +76,6 @@ const api = {
     },
     registerCommands: () => {
         return apiClient.post('/api/discord/register_commands');
-    },
-    pause: () => {
-        return apiClient.post('/api/pause');
-    },
-    resume: () => {
-        return apiClient.post('/api/resume');
     },
     clearThreads: () => {
         return apiClient.post('/api/clear_threads');
@@ -188,6 +169,10 @@ const api = {
     updateBotState: async (updateData: RuntimeConfigUpdate): Promise<RuntimeConfigModel> => {
         const response = await apiClient.patch('/api/config', updateData);
         return new RuntimeConfigModel(response.data);
+    },
+    getUserFeedbackByID: async (userFeedbackID: number): Promise<UserFeedback> => {
+        const response = await apiClient.get(`/api/user_feedback/${userFeedbackID}`);
+        return new UserFeedback(response.data);
     },
     getUserFeedback: async (
         order: string = "desc",

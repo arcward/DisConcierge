@@ -10,9 +10,8 @@ var (
 	runCmd = &cobra.Command{
 		Use:   "run [flags]",
 		Short: "Starts the DisConcierge bot, API and (optionally) webhook server",
-		Run: func(cmd *cobra.Command, args []string) {
+		Run: func(cmd *cobra.Command, _ []string) {
 			ctx := cmd.Context()
-
 			dai, err := disconcierge.New(cfg)
 			if err != nil {
 				log.Fatalf("error creating disconcierge: %s", err.Error())
@@ -27,12 +26,5 @@ var (
 
 //goland:noinspection GoLinter
 func init() {
-	// FIXME --dev doesn't override viper
-	runCmd.Flags().BoolVar(
-		&cfg.API.Development,
-		"dev",
-		false,
-		"API dev mode (sets SameSite=None)",
-	)
 	rootCmd.AddCommand(runCmd)
 }

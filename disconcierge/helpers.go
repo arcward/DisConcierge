@@ -55,58 +55,27 @@ func minifyString(s string, limit int) string {
 	if len(s) <= limit {
 		return s
 	}
-	s = strings.ReplaceAll(s, "\n\n", "\n")
-	if len(s) <= limit {
-		return s
-	}
-	s = strings.ReplaceAll(s, "**", "")
-	if len(s) <= limit {
-		return s
-	}
-	suffix := "\n\n**(output limit reached)**"
-	return fmt.Sprintf(
-		"%s%s",
-		string([]rune(s)[:limit-1-len([]rune(suffix))]),
-		suffix,
-	)
-}
 
-// shortenString reduces the size of the input string to a specified limit.
-//
-// This function attempts to minimize the input string by removing double newlines
-// and asterisks. If the string is still too long, it truncates the string and appends
-// a suffix indicating that the output limit was reached.
-//
-// Parameters:
-//   - s: The input string to be shortened.
-//   - limit: The maximum length of the output string.
-//
-// Returns:
-//   - string: The shortened string, possibly truncated with a suffix.
-func shortenString(s string, limit int) string {
-	if len(s) <= limit {
-		return s
-	}
 	s = strings.ReplaceAll(s, "\n\n", "\n")
 	if len(s) <= limit {
 		return s
 	}
+
 	s = strings.ReplaceAll(s, "**", "")
 	if len(s) <= limit {
 		return s
 	}
+
 	suffix := "\n\n**(output limit reached)**"
 	suffixChars := []rune(suffix)
 	if limit-len(suffixChars) <= 0 {
 		return strings.TrimSpace(string([]rune(s)[:limit]))
 	}
 
-	return strings.TrimSpace(
-		fmt.Sprintf(
-			"%s%s",
-			string([]rune(s)[:limit-len([]rune(suffix))]),
-			suffix,
-		),
+	return fmt.Sprintf(
+		"%s%s",
+		string([]rune(s)[:limit-1-len([]rune(suffix))]),
+		suffix,
 	)
 }
 
@@ -153,23 +122,29 @@ var discordGoLogLevels = map[int]slog.Level{
 	discordgo.LogInformational: slog.LevelInfo,
 }
 
-func tlsConfig(certfile string, keyfile string, minVersion uint16) (
-	*tls.Config,
-	error,
-) {
-	certs := make([]tls.Certificate, 1)
+func tlsConfig(cfg *SSLConfig) (*tls.Config, error) {
+	var cert tls.Certificate
+	var err error
 
-	cert, err := tls.LoadX509KeyPair(
-		certfile,
-		keyfile,
-	)
+	switch {
+	case cfg.CertFile != "" && cfg.KeyFile != "":
+		cert, err = tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
+	case cfg.CertPEM != "" && cfg.KeyPEM != "":
+		cert, err = tls.X509KeyPair([]byte(cfg.CertPEM), []byte(cfg.KeyPEM))
+	default:
+		return nil, errors.New("missing certificate and key")
+	}
+
 	if err != nil {
 		return nil, err
 	}
-	certs[0] = cert
+
+	if cfg.TLSMinVersion == 0 {
+		cfg.TLSMinVersion = tls.VersionTLS13
+	}
 	return &tls.Config{
-		Certificates: certs,
-		MinVersion:   minVersion,
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   cfg.TLSMinVersion,
 		ClientAuth:   tls.NoClientCert,
 	}, nil
 }
@@ -327,8 +302,8 @@ func derive64ByteKey(input string) []byte {
 	return hash[:]
 }
 
-// hashPassword securely hashes a password using Argon2id
-func hashPassword(password string) (string, error) {
+// HashPassword securely hashes a password using Argon2id
+func HashPassword(password string) (string, error) {
 	salt := make([]byte, 16)
 	if _, err := rand.Read(salt); err != nil {
 		return "", err
@@ -359,8 +334,8 @@ func hashPassword(password string) (string, error) {
 	return encodedHash, nil
 }
 
-// verifyPassword checks if the provided password matches the stored hash
-func verifyPassword(storedHash, password string) (bool, error) {
+// VerifyPassword checks if the provided password matches the stored hash
+func VerifyPassword(storedHash, password string) (bool, error) {
 	parts := strings.Split(storedHash, "$")
 	if len(parts) != 6 {
 		return false, errors.New("invalid hash format")

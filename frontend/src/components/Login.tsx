@@ -17,7 +17,6 @@ const Login = () => {
     const {login, isAuthenticated} = useAuth();
 
     const handleClose = (event: any) => {
-
         setOpen(false);
     };
 

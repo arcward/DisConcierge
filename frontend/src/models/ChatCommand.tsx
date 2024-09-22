@@ -1,12 +1,5 @@
 import UserModel from './User';
 
-
-enum FeedbackButtonState {
-    HIDDEN = 0,
-    ENABLED = 1,
-    DISABLED = 2
-}
-
 interface IChatCommand {
     state: string;
     step: string;
@@ -22,12 +15,6 @@ interface IChatCommand {
     usage_completion_tokens?: number;
     usage_total_tokens?: number;
     custom_id: string;
-
-    feedback_button_state_good: FeedbackButtonState;
-    feedback_button_state_outdated: FeedbackButtonState;
-    feedback_button_state_hallucinated: FeedbackButtonState;
-    feedback_button_state_other: FeedbackButtonState;
-    feedback_button_state_reset: FeedbackButtonState;
 
     user_id: string;
     interaction_id: string;
@@ -69,12 +56,6 @@ class ChatCommand implements IChatCommand {
     usage_total_tokens?: number;
     custom_id: string;
 
-    feedback_button_state_good: FeedbackButtonState;
-    feedback_button_state_outdated: FeedbackButtonState;
-    feedback_button_state_hallucinated: FeedbackButtonState;
-    feedback_button_state_other: FeedbackButtonState;
-    feedback_button_state_reset: FeedbackButtonState;
-
     user_id: string;
     interaction_id: string;
     discord_message_id: string;
@@ -112,12 +93,6 @@ class ChatCommand implements IChatCommand {
         this.usage_completion_tokens = data.usage_completion_tokens ?? 0;
         this.usage_total_tokens = data.usage_total_tokens ?? 0;
         this.custom_id = data.custom_id ?? '';
-
-        this.feedback_button_state_good = data.feedback_button_state_good ?? FeedbackButtonState.HIDDEN;
-        this.feedback_button_state_outdated = data.feedback_button_state_outdated ?? FeedbackButtonState.HIDDEN;
-        this.feedback_button_state_hallucinated = data.feedback_button_state_hallucinated ?? FeedbackButtonState.HIDDEN;
-        this.feedback_button_state_other = data.feedback_button_state_other ?? FeedbackButtonState.HIDDEN;
-        this.feedback_button_state_reset = data.feedback_button_state_reset ?? FeedbackButtonState.HIDDEN;
 
         this.user_id = data.user_id ?? '';
         this.interaction_id = data.interaction_id ?? '';

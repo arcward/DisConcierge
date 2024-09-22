@@ -7,23 +7,21 @@ import {MemoryRouter as Router}     from 'react-router-dom';
 
 // Mock the api
 jest.mock('./api/apiClient', () => ({
-    setupRequired: jest.fn().mockResolvedValue({required: false}),
+
     loggedIn: jest.fn().mockResolvedValue({username: 'testuser'}),
 }));
 
 
 describe('AuthProvider', () => {
     it('initializes correctly', async () => {
-        (api.setupRequired as jest.Mock).mockResolvedValue({required: false});
+
         (api.loggedIn as jest.Mock).mockResolvedValue({username: 'testuser'});
 
-        let testSetupRequired;
         let testIsAuthenticated;
         let testUsername;
 
         const TestComponent = () => {
-            const {setupRequired, isAuthenticated, username} = useAuth();
-            testSetupRequired = setupRequired;
+            const { isAuthenticated, username} = useAuth();
             testIsAuthenticated = isAuthenticated;
             testUsername = username;
 
@@ -44,7 +42,6 @@ describe('AuthProvider', () => {
             );
         });
 
-        expect(testSetupRequired).toBe(false);
         expect(testIsAuthenticated).toBe(true);
         expect(testUsername).toBe('testuser');
     });

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
-	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -13,35 +12,28 @@ import (
 	"github.com/lmittmann/tint"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 )
 
 type DiscordWebhookServer struct {
-	config        DiscordWebhookServerConfig
-	httpServer    *http.Server
-	listener      net.Listener
-	engine        *gin.Engine
-	logger        *slog.Logger
-	httpServerURL string
+	config     DiscordWebhookServerConfig
+	httpServer *http.Server
+	engine     *gin.Engine
+	logger     *slog.Logger
 }
 
-func (d *DiscordWebhookServer) Serve(ctx context.Context) error {
-	if d.listener != nil {
-		return d.httpServer.Serve(d.listener)
+func (d *DiscordWebhookServer) Serve(_ context.Context) error {
+	if d.httpServer.TLSConfig == nil {
+		d.logger.Warn("starting server without TLS")
+		return d.httpServer.ListenAndServe()
 	}
+	return d.httpServer.ListenAndServeTLS("", "")
 
-	listenCfg := &net.ListenConfig{}
-	ln, e := listenCfg.Listen(ctx, d.config.ListenNetwork, d.config.Listen)
-	if e != nil {
-		panic(e)
-	}
-	ln = tls.NewListener(ln, d.httpServer.TLSConfig)
-	d.listener = ln
-	return d.httpServer.Serve(d.listener)
 }
 
+// newWebhookServer creates and returns a new [DiscordWebhookServer], and/or
+// any errors that occurred during creation.
 func newWebhookServer(
 	d *DisConcierge,
 	config DiscordWebhookServerConfig,
@@ -56,44 +48,36 @@ func newWebhookServer(
 	)
 
 	r := gin.New()
-
-	api := &DiscordWebhookServer{
-		config: config,
-		engine: r,
-	}
-
-	tlsCfg, e := tlsConfig(
-		config.SSL.Cert,
-		config.SSL.Key,
-		config.SSL.TLSMinVersion,
-	)
-	if e != nil {
-		return nil, fmt.Errorf("error loading webhook SSL certs: %w", e)
-	}
+	api := &DiscordWebhookServer{config: config, engine: r}
 
 	httpServer := &http.Server{
 		Addr:              config.Listen,
 		Handler:           r,
-		TLSConfig:         tlsCfg,
 		ReadTimeout:       config.ReadTimeout,
 		ReadHeaderTimeout: config.ReadHeaderTimeout,
 		WriteTimeout:      config.WriteTimeout,
+	}
+	if config.SSL != nil {
+		tlsCfg, e := tlsConfig(config.SSL)
+		if e != nil {
+			return nil, fmt.Errorf("error loading webhook SSL certs: %w", e)
+		}
+		httpServer.TLSConfig = tlsCfg
 	}
 	api.httpServer = httpServer
 
 	api.logger = logger.With(loggerNameKey, "discord_webhook")
 
+	if d.config.Development {
+		gin.SetMode(gin.DebugMode)
+	} else {
+		gin.SetMode(gin.ReleaseMode)
+		r.Use(gin.Recovery())
+	}
 	r.Use(
-		gin.Recovery(),
 		requestIDMiddleware(),
 		ginLoggingMiddleware(),
 		discordRequestAuthenticationMiddleware(d.discord.publicKey),
-	)
-
-	r.GET(
-		apiHealthCheck, func(c *gin.Context) {
-			ginReplyMessage(c, "ok")
-		},
 	)
 
 	r.POST(
@@ -121,6 +105,7 @@ func (WebhookHandler) InteractionReceiveMethod() DiscordInteractionReceiveMethod
 func (w WebhookHandler) Respond(
 	_ context.Context,
 	response *discordgo.InteractionResponse,
+	_ ...discordgo.RequestOption,
 ) error {
 	w.ginContext.JSON(http.StatusOK, response)
 	return nil

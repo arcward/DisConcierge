@@ -17,8 +17,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -294,7 +292,7 @@ func TestIgnoredClearCommand(t *testing.T) {
 	u, _, err := bot.GetOrCreateUser(ctx, discordUser)
 	require.NoError(t, err)
 
-	_, err = bot.writeDB.Update(u, "ignored", true)
+	_, err = bot.writeDB.Update(context.TODO(), u, "ignored", true)
 	require.NoError(t, err)
 
 	i := &discordgo.InteractionCreate{
@@ -613,9 +611,9 @@ func (c discordChannelMessageSendHandler) ChannelMessageSend(
 		c.t.Logf("sending error: %v", c.errorOnSend)
 		c.errCh <- c.errorOnSend
 		return nil, c.errorOnSend
-	} else {
-		c.t.Logf("no error to send")
 	}
+	c.t.Logf("no error to send")
+
 	return c.DiscordSessionHandler.ChannelMessageSend(channelID, message)
 }
 
@@ -629,7 +627,11 @@ func TestDiscord_HandlersConnectDisconnect(t *testing.T) {
 		t:                     t,
 	}
 	channelID := fmt.Sprintf("c_%s", t.Name())
-	bot := &DisConcierge{runtimeConfig: &RuntimeConfig{CommandOptions: CommandOptions{DiscordNotificationChannelID: channelID}}}
+	bot := &DisConcierge{
+		runtimeConfig: &RuntimeConfig{
+			CommandOptions: CommandOptions{DiscordNotificationChannelID: channelID},
+		},
+	}
 	cfg := DiscordConfig{
 		StartupMessage: t.Name(),
 	}
@@ -692,7 +694,7 @@ func TestDiscord_HandlersConnectDisconnect(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for message")
 	case sendErr := <-connectSession.errCh:
-		require.NotNil(t, sendErr)
+		require.Error(t, sendErr)
 		require.Equal(t, sendErr.Error(), errMsg)
 	}
 }
@@ -716,7 +718,6 @@ type stubChannelMessageSend struct {
 func newStubInteractionHandler(t testing.TB) stubInteractionHandler {
 	t.Helper()
 	return stubInteractionHandler{
-
 		callRespond:            make(chan *discordgo.InteractionResponse, 100),
 		callMessageReply:       make(chan *stubMessageReply, 100),
 		callGetResponse:        make(chan struct{}, 100),
@@ -728,6 +729,7 @@ func newStubInteractionHandler(t testing.TB) stubInteractionHandler {
 			session: newMockDiscordSession(),
 			logger:  slog.Default().With("test_name", t.Name()),
 		},
+		config: DefaultTestRuntimeConfig(t).CommandOptions,
 	}
 }
 
@@ -759,7 +761,7 @@ func (s stubInteractionHandler) ChannelMessageSend(
 	return &discordgo.Message{}, nil
 }
 
-func (s stubInteractionHandler) InteractionReceiveMethod() DiscordInteractionReceiveMethod {
+func (stubInteractionHandler) InteractionReceiveMethod() DiscordInteractionReceiveMethod {
 	return DiscordInteractionReceiveMethod("testcase")
 }
 
@@ -780,6 +782,7 @@ func (s stubInteractionHandler) ChannelMessageSendReply(
 func (s stubInteractionHandler) Respond(
 	_ context.Context,
 	i *discordgo.InteractionResponse,
+	_ ...discordgo.RequestOption,
 ) error {
 	s.callRespond <- i
 	return nil
@@ -943,11 +946,10 @@ func TestNotifyDiscordUserReachedRateLimit(t *testing.T) {
 	t.Parallel()
 
 	cfg := DefaultTestConfig(t)
-	// Create a new DisConcierge instance
+
 	discord, err := newDiscord(cfg.Discord)
 	require.NoError(t, err)
 
-	// Create a mock Discord session
 	mockSession := newMockDiscordSession()
 	messageHandler := discordChannelMessageSendHandler{
 		DiscordSessionHandler: mockSession,
@@ -958,7 +960,6 @@ func TestNotifyDiscordUserReachedRateLimit(t *testing.T) {
 	}
 	discord.session = messageHandler
 
-	// Set up test data
 	user := &User{
 		ID:         "testuser123",
 		GlobalName: "Test User",
@@ -971,20 +972,22 @@ func TestNotifyDiscordUserReachedRateLimit(t *testing.T) {
 	}
 	prompt := "This is a test prompt"
 
-	// Set up the notification channel
 	notificationChannelID := "notification-channel-123"
 
 	testLogger := slog.Default().With("test", t.Name())
-	// Call the function
+
 	ctx := context.Background()
-	notifyDiscordUserReachedRateLimit(
-		ctx,
-		testLogger,
-		discord,
-		user,
-		usage,
-		prompt,
-		notificationChannelID,
+	assert.True(
+		t,
+		notifyDiscordUserReachedRateLimit(
+			ctx,
+			testLogger,
+			discord,
+			user,
+			usage,
+			prompt,
+			notificationChannelID,
+		),
 	)
 
 	// Check if the message was sent
@@ -1013,169 +1016,33 @@ func TestNotifyDiscordUserReachedRateLimit(t *testing.T) {
 		Billable6h: 5,
 		Limit6h:    10,
 	}
-	notifyDiscordUserReachedRateLimit(
-		ctx,
-		testLogger,
-		discord,
-		user,
-		usageBelowLimit,
-		prompt,
-		notificationChannelID,
+	assert.False(
+		t, notifyDiscordUserReachedRateLimit(
+			ctx,
+			testLogger,
+			discord,
+			user,
+			usageBelowLimit,
+			prompt,
+			notificationChannelID,
+		),
 	)
-
-	// Ensure no message was sent
-	select {
-	case <-messageHandler.messagesSent:
-		t.Fatal("Message was sent when it shouldn't have been")
-	case <-time.After(1 * time.Second):
-		// This is the expected behavior
-	}
 
 	// Test case when notification channel is not set
-	notifyDiscordUserReachedRateLimit(
-		ctx,
-		testLogger,
-		discord,
-		user,
-		usageBelowLimit,
-		prompt,
-		"",
+	assert.False(
+		t, notifyDiscordUserReachedRateLimit(
+			ctx,
+			testLogger,
+			discord,
+			user,
+			usageBelowLimit,
+			prompt,
+			"",
+		),
 	)
-
-	// Ensure no message was sent
-	select {
-	case <-messageHandler.messagesSent:
-		t.Fatal("Message was sent when notification channel was not set")
-	case <-time.After(1 * time.Second):
-		// This is the expected behavior
-	}
 }
 
-func TestDisConcierge_NotifyDiscordUserFeedback(t *testing.T) {
-	t.Parallel()
-	bot, _ := newDisConcierge(t)
-
-	mockSession := newMockDiscordSession()
-	connectSession := discordChannelMessageSendHandler{
-		DiscordSessionHandler: mockSession,
-		messagesSent:          make(chan stubChannelMessageSend, 100),
-		repliesSent:           make(chan stubMessageReply, 100),
-		errCh:                 make(chan error, 100),
-		t:                     t,
-	}
-	bot.discord.session = connectSession
-
-	channelID := fmt.Sprintf("c_%s", t.Name())
-	bot.runtimeConfig.DiscordNotificationChannelID = channelID
-
-	discordUser := newDiscordUser(t)
-	user, _, err := bot.GetOrCreateUser(context.Background(), *discordUser)
-	require.NoError(t, err)
-
-	ids := newCommandData(t)
-	interaction := newDiscordInteraction(t, discordUser, ids.InteractionID, t.Name())
-
-	chatCommand, err := NewChatCommand(user, interaction)
-	require.NoError(t, err)
-
-	chatCommandResponse := "Foo!"
-	chatCommand.Response = &chatCommandResponse
-
-	require.NoError(t, bot.db.Create(chatCommand).Error)
-	require.NoError(t, bot.hydrateChatCommand(context.Background(), chatCommand))
-
-	var receivedMessages []stubChannelMessageSend
-
-	wg := &sync.WaitGroup{}
-
-	report := UserFeedback{
-		ChatCommandID: &chatCommand.ID,
-		UserID:        &user.ID,
-		Type:          string(UserFeedbackOther),
-		Description:   feedbackTypeDescription[UserFeedbackOther],
-		Detail:        "The information provided is incorrect.",
-	}
-
-	ctx := context.Background()
-	bot.notifyDiscordUserFeedback(ctx, *chatCommand, report)
-
-	// Test with UserFeedbackGood
-	report.Type = string(UserFeedbackGood)
-	report.Description = "Good"
-	report.Detail = ""
-
-	bot.notifyDiscordUserFeedback(ctx, *chatCommand, report)
-
-	wg.Add(3)
-	go func() {
-		for i := 0; i < 3; i++ {
-			select {
-			case msg := <-connectSession.messagesSent:
-				receivedMessages = append(receivedMessages, msg)
-				wg.Done()
-			case <-time.After(10 * time.Second):
-				t.Error("Timeout waiting for message")
-				wg.Done()
-			}
-		}
-	}()
-
-	wg.Wait()
-	require.Len(t, receivedMessages, 3)
-	assert.True(t, messageContains(t, receivedMessages, "# Received feedback: **Good**"))
-	assert.True(t, messageContains(t, receivedMessages, "New user seen!"))
-	assert.True(t, messageContains(t, receivedMessages, ":warning: Received feedback: **Other**"))
-
-	// Test with empty notification channel
-	ct, err := bot.writeDB.Update(
-		bot.runtimeConfig,
-		columnRuntimeConfigDiscordNotificationChannelID,
-		"",
-	)
-	require.Equal(t, int64(1), ct)
-	require.NoError(t, err)
-	require.Empty(t, bot.runtimeConfig.DiscordNotificationChannelID)
-	handler := bot.getInteractionHandlerFunc(context.Background(), interaction)
-	chatCommand.handler = handler
-	bot.notifyDiscordUserFeedback(ctx, *chatCommand, report)
-
-	ct, err = bot.writeDB.Update(
-		bot.runtimeConfig,
-		columnRuntimeConfigDiscordNotificationChannelID,
-		channelID,
-	)
-	require.Equal(t, int64(1), ct)
-	require.NoError(t, err)
-	require.Equal(t, bot.runtimeConfig.DiscordNotificationChannelID, channelID)
-
-	connectSession.errorOnSend = errors.New("failed to send message")
-	bot.discord.session = connectSession
-	chatCommand.handler = bot.getInteractionHandlerFunc(context.Background(), interaction)
-	t.Log("sending message with error")
-	bot.notifyDiscordUserFeedback(ctx, *chatCommand, report)
-
-	select {
-	case err := <-connectSession.errCh:
-		assert.Error(t, err)
-		assert.Equal(t, "failed to send message", err.Error())
-	case <-time.After(300 * time.Second):
-		t.Fatal("Timeout waiting for error")
-	}
-}
-
-func messageContains(t testing.TB, messages []stubChannelMessageSend, substr string) bool {
-	t.Helper()
-	for _, msg := range messages {
-		if strings.Contains(msg.Content, substr) {
-			return true
-		}
-	}
-	return false
-}
-
-type interactionLoadTest struct {
-	user        discordgo.User
-	prompt      string
+type mockWebhookInteraction struct {
 	Interaction *discordgo.InteractionCreate
 	Response    *discordgo.InteractionResponse
 	Error       error
@@ -1195,7 +1062,7 @@ type MockDiscord struct {
 func (m *MockDiscord) InteractionPOST(
 	ctx context.Context,
 	i *discordgo.InteractionCreate,
-) (*interactionLoadTest, error) {
+) (*mockWebhookInteraction, error) {
 	data, err := json.Marshal(i)
 	if err != nil {
 		panic(err)
@@ -1205,7 +1072,7 @@ func (m *MockDiscord) InteractionPOST(
 	if err != nil {
 		panic(err)
 	}
-	interactionTest := &interactionLoadTest{Interaction: i}
+	interactionTest := &mockWebhookInteraction{Interaction: i}
 	defer func() {
 		interactionTest.FinishedAt = time.Now()
 	}()
@@ -1292,7 +1159,7 @@ func newMockDiscordSession() mockDiscordSession {
 	m := mockDiscordSession{
 		logLevel: &slog.LevelVar{},
 	}
-	m.logLevel.Set(slog.LevelDebug)
+	m.logLevel.Set(slog.LevelWarn)
 	m.logger = slog.New(
 		tint.NewHandler(
 			os.Stdout, &tint.Options{
@@ -1451,4 +1318,154 @@ func (d mockDiscordSession) SetIdentify(_ discordgo.Identify) {
 func (d mockDiscordSession) SetLogLevel(lvl slog.Level) error {
 	d.logLevel.Set(lvl)
 	return nil
+}
+
+func TestNotifyDiscordUserFeedback(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultTestConfig(t)
+	cfg.API.ExternalURL = "https://test.example.com"
+
+	bot, _ := newDisConcierge(t)
+	bot.config = cfg
+
+	discord, err := newDiscord(cfg.Discord)
+	require.NoError(t, err)
+
+	mockSession := newMockDiscordSession()
+	messageHandler := discordChannelMessageSendHandler{
+		DiscordSessionHandler: mockSession,
+		messagesSent:          make(chan stubChannelMessageSend, 1),
+		repliesSent:           make(chan stubMessageReply, 1),
+		errCh:                 make(chan error, 1),
+		t:                     t,
+	}
+	discord.session = messageHandler
+	bot.discord = discord
+
+	user := User{
+		ID:         "testuser123",
+		GlobalName: "Test User",
+	}
+
+	chatCommand := ChatCommand{}
+	chatCommand.ID = 1000
+
+	notificationChannelID := "notification-channel-123"
+
+	testCases := []struct {
+		name           string
+		feedbackType   FeedbackButtonType
+		expectedEmoji  string
+		configSetup    func(*RuntimeConfig)
+		expectMessage  bool
+		expectedErrMsg string
+	}{
+		{
+			name:          "Good feedback",
+			feedbackType:  UserFeedbackGood,
+			expectedEmoji: ":thumbsup:",
+			configSetup: func(rc *RuntimeConfig) {
+				rc.DiscordNotificationChannelID = notificationChannelID
+				rc.DiscordGatewayEnabled = true
+			},
+			expectMessage: true,
+		},
+		{
+			name:          "Bad feedback",
+			feedbackType:  UserFeedbackOutdated,
+			expectedEmoji: ":thumbsdown:",
+			configSetup: func(rc *RuntimeConfig) {
+				rc.DiscordNotificationChannelID = notificationChannelID
+				rc.DiscordGatewayEnabled = true
+			},
+			expectMessage: true,
+		},
+		{
+			name:          "Notification channel not set",
+			feedbackType:  UserFeedbackGood,
+			expectedEmoji: ":thumbsup:",
+			configSetup: func(rc *RuntimeConfig) {
+				rc.DiscordNotificationChannelID = ""
+				rc.DiscordGatewayEnabled = true
+			},
+			expectMessage: false,
+		},
+		{
+			name:          "Discord gateway disabled",
+			feedbackType:  UserFeedbackGood,
+			expectedEmoji: ":thumbsup:",
+			configSetup: func(rc *RuntimeConfig) {
+				rc.DiscordNotificationChannelID = notificationChannelID
+				rc.DiscordGatewayEnabled = false
+			},
+			expectMessage: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(
+			tc.name, func(t *testing.T) {
+				originalConfig := bot.runtimeConfig
+				t.Cleanup(
+					func() {
+						bot.runtimeConfig = originalConfig
+					},
+				)
+
+				runtimeConfig := *originalConfig
+				tc.configSetup(&runtimeConfig)
+				bot.runtimeConfig = &runtimeConfig
+				report := UserFeedback{
+					ChatCommandID: &chatCommand.ID,
+					Type:          string(tc.feedbackType),
+					Description:   "Test feedback",
+				}
+				report.ID = 1
+
+				ctx := context.Background()
+				bot.notifyDiscordUserFeedback(ctx, chatCommand, report, user)
+
+				if tc.expectMessage {
+					select {
+					case msg := <-messageHandler.messagesSent:
+						assert.Equal(t, notificationChannelID, msg.ChannelID)
+						assert.Contains(t, msg.Content, tc.expectedEmoji)
+						assert.Contains(t, msg.Content, user.GlobalName)
+						assert.Contains(t, msg.Content, report.Description)
+						assert.Contains(
+							t,
+							msg.Content,
+							fmt.Sprintf(
+								"%s%s%d",
+								cfg.API.ExternalURL,
+								adminPathUserFeedback,
+								report.ID,
+							),
+						)
+						assert.Contains(
+							t,
+							msg.Content,
+							fmt.Sprintf(
+								"%s%s%d",
+								cfg.API.ExternalURL,
+								adminPathChatCommand,
+								chatCommand.ID,
+							),
+						)
+					case <-time.After(time.Minute):
+						t.Fatal("Timeout waiting for message to be sent")
+					}
+				} else {
+					select {
+					case <-messageHandler.messagesSent:
+						t.Fatal("Unexpected message sent")
+					case <-time.After(1 * time.Second):
+						// No message sent, as expected
+					}
+				}
+			},
+		)
+	}
 }

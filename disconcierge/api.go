@@ -29,7 +29,6 @@ import (
 	"io/fs"
 	"log/slog"
 	"math/big"
-	"net"
 	"net/http"
 	"os"
 	"reflect"
@@ -41,26 +40,39 @@ import (
 )
 
 const (
-	pprofPrefix                = "/debug"
+	// Admin interface URLs
+
+	// adminPathPrefix is the base URL for the React interface
+	adminPathPrefix = "/disconcierge"
+
+	// adminPathUserFeedback is the base URL to view user feedback.
+	// Add [UserFeedback.ID] to the end of this value.
+	adminPathUserFeedback = "/disconcierge/user_feedback/"
+
+	// adminPathChatCommand is the base URL to view a ChatCommand.
+	// Add [ChatCommand.ID] to the end of this value.
+	adminPathChatCommand = "/disconcierge/chat_command/"
+
+	// pprofPrefix is the base URL for the pprof interface
+	pprofPrefix = "/debug"
+
+	// Root-level API endpoints
+
+	pathLogin  = "/login"
+	pathLogout = "/logout"
+
+	// apiPrefix prefixes protected endpoints only
 	apiPrefix                  = "/api"
-	apiPathPause               = "/pause"
-	apiPathResume              = "/resume"
 	apiPathQuit                = "/quit"
 	apiPathClearThreads        = "/clear_threads"
-	apiPathLogin               = "/login"
-	apiPathLogout              = "/logout"
 	apiPathUpdateUser          = "/user/:id"
 	apiPathUserHistory         = "/user/:id/history"
 	apiPathUsers               = "/users"
 	apiPathReloadUsers         = "/users/reload"
 	apiPathRegisterCommands    = "/discord/register_commands"
 	apiPathLoggedIn            = "/logged_in"
-	apiHealthCheck             = "/healthz"
 	apiDiscordInteractions     = "/discord/interactions"
 	apiPathConfig              = "/config"
-	apiAdminSetup              = "/admin/create"
-	apiPathSetup               = "/setup"
-	apiPathSetupStatus         = "/setup/status"
 	apiListChatCommands        = "/chat_commands"
 	apiPathGetChatCommand      = "/chat_command/:id"
 	apiPathGetDiscordMessages  = "/discord_messages"
@@ -68,32 +80,31 @@ const (
 	apiPathOpenAICreateThread  = "/openai/logs/create_thread"
 	apiPathOpenAICreateMessage = "/openai/logs/create_message"
 	apiPathUserFeedback        = "/user_feedback"
+	apiPathUserFeedbackByID    = "/user_feedback/:id"
+	apiPathOpenAICreateRun     = "/openai/logs/create_run"
+	apiPathOpenAIListMessages  = "/openai/logs/list_messages"
+	apiPathOpenAIListRunSteps  = "/openai/logs/list_run_steps"
+	apiPathDiscordGatewayBot   = "/discord/gateway/bot"
 
-	apiPathOpenAICreateRun = "/openai/logs/create_run"
-
-	apiPathOpenAIListMessages = "/openai/logs/list_messages"
-	apiPathOpenAIListRunSteps = "/openai/logs/list_run_steps"
-
-	apiPathDiscordGatewayBot = "/discord/gateway/bot"
-)
-
-const (
+	// xRequestHeader is used to inject this value via requestIDMiddleware
 	xRequestIDHeader = "X-Request-ID"
-	sessionVarName   = "user"
-	sessionVarField  = "username"
-)
 
-var (
-	structValidator = validator.New()
-)
+	// sessionVarName is the name of the session cookie set on login
+	sessionVarName = "user"
 
-var (
+	// sessionVarField is the field in the session cookie that stores the login username
+	sessionVarField = "username"
+
 	Ascending  Sort = "asc"
 	Descending Sort = "desc"
 )
 
-//go:embed static
-var reactUI embed.FS
+var (
+	structValidator = validator.New()
+
+	//go:embed static
+	reactUI embed.FS
+)
 
 // API represents the main API server for DisConcierge.
 //
@@ -104,8 +115,6 @@ var reactUI embed.FS
 // Fields:
 //   - config: Configuration for the API server.
 //   - httpServer: The underlying HTTP server.
-//   - httpServerURL: The URL of the HTTP server.
-//   - listener:
 //   - engine:
 //   - store:
 //   - loginRequestLimiter:
@@ -133,17 +142,13 @@ var reactUI embed.FS
 // The API should be initialized using the newAPI function and started
 // with the Serve method.
 type API struct {
-	config              *APIConfig     // Configuration for the API server
-	httpServer          *http.Server   // The underlying HTTP server
-	listener            net.Listener   // Network listener for the HTTP server.
-	engine              *gin.Engine    //  Gin engine for routing HTTP requests
-	store               CookieStore    // CookieStore for session management.
-	loginRequestLimiter *rate.Limiter  // Rate limiter for login requests
-	requestMetrics      map[string]int // Metrics for API requests
-	requestMetricsMu    sync.Mutex     // Mutex for synchronizing access to request metrics
-	logger              *slog.Logger   // Logger for API-related events
-
-	handlers *APIHandlers // API request handlers
+	config              *APIConfig    // Configuration for the API server
+	httpServer          *http.Server  // The underlying HTTP server
+	engine              *gin.Engine   //  Gin engine for routing HTTP requests
+	store               CookieStore   // CookieStore for session management.
+	loginRequestLimiter *rate.Limiter // Rate limiter for login requests
+	logger              *slog.Logger  // Logger for API-related events
+	handlers            *APIHandlers  // API request handlers
 }
 
 // newAPI initializes and returns a new instance of the API struct.
@@ -170,11 +175,9 @@ func newAPI(d *DisConcierge, config *APIConfig) (*API, error) {
 	)
 
 	r := gin.New()
-
 	api := &API{
 		config:              config,
 		engine:              r,
-		requestMetrics:      map[string]int{},
 		loginRequestLimiter: rate.NewLimiter(rate.Limit(1), 1),
 	}
 	apiHandlers := NewAPIHandlers(d)
@@ -182,55 +185,53 @@ func newAPI(d *DisConcierge, config *APIConfig) (*API, error) {
 	api.store = apiHandlers.store
 	_ = r.Use(sessions.Sessions(sessionVarName, apiHandlers.store))
 
-	tlsCfg, e := tlsConfig(
-		config.SSL.Cert,
-		config.SSL.Key,
-		config.SSL.TLSMinVersion,
-	)
-	if e != nil {
-		return nil, fmt.Errorf("error loading SSL certs: %w", e)
-	}
-
 	httpServer := &http.Server{
 		Addr:              config.Listen,
 		Handler:           r,
-		TLSConfig:         tlsCfg,
 		WriteTimeout:      config.WriteTimeout,
 		IdleTimeout:       config.IdleTimeout,
 		ReadTimeout:       config.ReadTimeout,
 		ReadHeaderTimeout: config.ReadHeaderTimeout,
 	}
+
+	if config.SSL != nil {
+		tlsCfg, e := tlsConfig(config.SSL)
+		if e != nil {
+			return nil, fmt.Errorf("error loading SSL certs: %w", e)
+		}
+		httpServer.TLSConfig = tlsCfg
+	}
+
 	api.httpServer = httpServer
 	api.logger = setupLogger.With(loggerNameKey, "api")
 
 	corsConfig := config.CORS.GINConfig()
-	if len(corsConfig.AllowOrigins) == 0 && api.config.Development {
-		corsConfig.AllowOrigins = []string{"*"}
+
+	if d.config.Development {
+		ginPprof.Register(r, pprofPrefix)
+		gin.SetMode(gin.DebugMode)
+	} else {
+		gin.SetMode(gin.ReleaseMode)
+		r.Use(gin.Recovery())
+		if len(corsConfig.AllowOrigins) == 0 {
+			corsConfig.AllowOrigins = []string{"*"}
+		}
 	}
 
-	if !config.Development {
-		r.Use(gin.Recovery())
-	}
 	r.Use(
 		requestIDMiddleware(),
 		ginLoggingMiddleware(),
-		metricMiddleware(api),
 		cors.New(corsConfig),
 	)
 
-	r.POST(apiPathLogin, apiHandlers.loginHandler)
-	r.GET(apiHealthCheck, apiHandlers.healthCheck)
-	r.POST(apiPathLogout, apiHandlers.logoutHandler)
-
-	if config.Development {
-		ginPprof.Register(r, pprofPrefix)
-	}
-
+	// Mounts `static/static` to `/disconcierge` for the React UI
 	reactFS := getFileSystem()
-	r.StaticFS("/admin/", reactFS)
+	r.StaticFS(adminPathPrefix+"/", reactFS)
+
+	apiPrefixNotFound := apiPrefix + "/"
 	r.NoRoute(
 		func(c *gin.Context) {
-			if strings.HasPrefix(c.Request.URL.Path, "/api/") {
+			if strings.HasPrefix(c.Request.URL.Path, apiPrefixNotFound) {
 				c.AbortWithStatus(http.StatusNotFound)
 				return
 			}
@@ -238,36 +239,53 @@ func newAPI(d *DisConcierge, config *APIConfig) (*API, error) {
 		},
 	)
 
-	r.POST(apiPathSetup, apiHandlers.adminSetup)
-	r.GET(apiPathSetupStatus, apiHandlers.setupStatus)
+	// Authentication
+	r.POST(pathLogin, apiHandlers.loginHandler)
+	r.POST(pathLogout, apiHandlers.logoutHandler)
 
+	// endpoints requiring authentication
 	protected := r.Group(apiPrefix)
 	protected.Use(authMiddleware(d))
 
+	// Endpoint to validate the user's still logged in
 	protected.GET(apiPathLoggedIn, apiHandlers.loggedIn)
+
+	// ChatCommand endpoints
 	protected.GET(apiPathGetChatCommand, apiHandlers.getChatCommandDetail)
-	protected.GET(apiPathGetDiscordMessages, apiHandlers.getDiscordMessages)
 	protected.GET(apiListChatCommands, apiHandlers.getChatCommands)
 
-	protected.POST(apiPathReloadUsers, apiHandlers.reloadUsers)
+	// User endpoints
 	protected.GET(apiPathUsers, apiHandlers.getUsers)
 	protected.GET(apiPathUserHistory, apiHandlers.getUserHistory)
 	protected.PATCH(apiPathUpdateUser, apiHandlers.updateUser)
+
+	// Config endpoints
 	protected.GET(apiPathConfig, apiHandlers.getConfig)
 	protected.PATCH(apiPathConfig, apiHandlers.updateRuntimeConfig)
+
+	// "action" endpoints (can be called from the admin UI's 'actions' dropdown)
 	protected.POST(apiPathQuit, apiHandlers.botQuit)
+	protected.POST(apiPathReloadUsers, apiHandlers.reloadUsers)
 	protected.POST(apiPathClearThreads, apiHandlers.clearThreads)
 	protected.POST(
 		apiPathRegisterCommands,
 		apiHandlers.discordRegisterCommands,
 	)
+
+	// Runtime "log" endpoints
 	protected.GET(apiPathOpenAIRetrieveRuns, apiHandlers.getOpenAIRetrieveRunLogs)
 	protected.GET(apiPathOpenAICreateThread, apiHandlers.getOpenAICreateThreadLogs)
 	protected.GET(apiPathOpenAICreateMessage, apiHandlers.getOpenAICreateMessageLogs)
 	protected.GET(apiPathOpenAICreateRun, apiHandlers.getOpenAICreateRunLogs)
 	protected.GET(apiPathOpenAIListMessages, apiHandlers.getOpenAIListMessagesLogs)
 	protected.GET(apiPathOpenAIListRunSteps, apiHandlers.getOpenAIListRunStepsLogs)
+	protected.GET(apiPathGetDiscordMessages, apiHandlers.getDiscordMessages)
+
+	// user feedback
 	protected.GET(apiPathUserFeedback, apiHandlers.getUserFeedback)
+	protected.GET(apiPathUserFeedbackByID, apiHandlers.userFeedbackByID)
+
+	// Discord API "proxy" to get bot info
 	protected.GET(apiPathDiscordGatewayBot, apiHandlers.getDiscordGatewayBot)
 
 	runtime.SetMutexProfileFraction(1)
@@ -275,19 +293,15 @@ func newAPI(d *DisConcierge, config *APIConfig) (*API, error) {
 	return api, nil
 }
 
-func (a *API) Serve(ctx context.Context) error {
-	if a.listener != nil {
-		return a.httpServer.Serve(a.listener)
+// Serve either calls ListenAndServe or ListenAndServeTLS on the
+// underlying http.Server
+func (a *API) Serve(_ context.Context) error {
+	if a.httpServer.TLSConfig == nil {
+		a.logger.Warn("no TLS config set, server will use unencrypted HTTP")
+		return a.httpServer.ListenAndServe()
 	}
-	listenCfg := &net.ListenConfig{}
-	ln, e := listenCfg.Listen(ctx, a.config.ListenNetwork, a.config.Listen)
+	return a.httpServer.ListenAndServeTLS("", "")
 
-	if e != nil {
-		panic(e)
-	}
-	ln = tls.NewListener(ln, a.httpServer.TLSConfig)
-	a.listener = ln
-	return a.httpServer.Serve(a.listener)
 }
 
 func (a *API) getSessionUsername(c *gin.Context) (string, error) {
@@ -356,7 +370,7 @@ func NewAPIHandlers(d *DisConcierge) *APIHandlers {
 
 	store := NewCookieStore(secretKey)
 	sameSite := http.SameSiteStrictMode
-	if d.config.API.Development {
+	if d.config.Development {
 		sameSite = http.SameSiteNoneMode
 	}
 	store.Options(
@@ -368,85 +382,6 @@ func NewAPIHandlers(d *DisConcierge) *APIHandlers {
 		},
 	)
 	return &APIHandlers{d: d, logger: logger, store: store}
-}
-
-// setupStatus handles the HTTP GET request to check the setup status.
-//
-// This function checks if the initial admin setup is pending and sends a JSON response
-// indicating whether the setup is required.
-//
-// Parameters:
-//   - c: The Gin context for the request.
-//
-// Responses:
-//   - 200 OK: Returns a JSON object with the setup status.
-func (h *APIHandlers) setupStatus(c *gin.Context) {
-	c.JSON(http.StatusOK, setupResponse{Required: h.d.pendingSetup.Load()})
-}
-
-// adminSetup handles the HTTP POST request for the initial admin setup.
-//
-// This function locks the configuration mutex, validates the setup payload,
-// and updates the admin credentials in the database. It ensures that the
-// setup is only performed if it is pending.
-//
-// Parameters:
-//   - c: The Gin context for the request.
-//
-// Responses:
-//   - 201 Created: If the admin credentials were successfully set.
-//   - 400 Bad Request: If the request payload is invalid.
-//   - 403 Forbidden: If the setup is not pending.
-//   - 500 Internal Server Error: If there is an error updating the admin credentials.
-func (h *APIHandlers) adminSetup(c *gin.Context) {
-	h.d.cfgMu.Lock()
-	defer h.d.cfgMu.Unlock()
-
-	if !h.d.pendingSetup.Load() {
-		c.JSON(http.StatusForbidden, httpError{Error: "Forbidden"})
-		return
-	}
-
-	logger := ginContextLogger(c)
-	logger.Info("first time admin setup")
-	var adminSetup adminSetupPayload
-
-	if e := c.ShouldBindJSON(&adminSetup); e != nil {
-		logger.Error("bad payload", tint.Err(e))
-		c.JSON(http.StatusBadRequest, gin.H{"error": e.Error()})
-		return
-	}
-
-	currentState := h.d.runtimeConfig
-
-	username := adminSetup.Username
-
-	password, err := hashPassword(adminSetup.Password)
-	if err != nil {
-		logger.Error("error hashing password", tint.Err(err))
-		c.JSON(
-			http.StatusInternalServerError,
-			gin.H{"error": "error setting admin credentials"},
-		)
-		return
-	}
-
-	if _, err = h.d.writeDB.Updates(
-		currentState, map[string]any{
-			columnRuntimeConfigAdminUsername: username,
-			columnRuntimeConfigAdminPassword: password,
-		},
-	); err != nil {
-		logger.Error("error updating admin credentials", tint.Err(err))
-		c.JSON(
-			http.StatusInternalServerError,
-			gin.H{"error": "error updating admin credentials"},
-		)
-		return
-	}
-	h.d.runtimeConfig = currentState
-	h.d.pendingSetup.Store(false)
-	c.JSON(http.StatusCreated, gin.H{"message": "admin credentials set"})
 }
 
 // loginHandler handles the HTTP POST request to log in a user.
@@ -469,7 +404,7 @@ func (h *APIHandlers) loginHandler(c *gin.Context) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	if !h.d.api.loginRequestLimiter.Allow() {
+	if h.d.api.loginRequestLimiter != nil && !h.d.api.loginRequestLimiter.Allow() {
 		logger.Warn("login rate limited")
 
 		c.AbortWithStatus(http.StatusTooManyRequests)
@@ -478,29 +413,34 @@ func (h *APIHandlers) loginHandler(c *gin.Context) {
 
 	var login userLogin
 	if err := c.ShouldBindJSON(&login); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Bad request"})
+		return
 	}
 
 	runtimeConfig := h.d.RuntimeConfig()
 	if runtimeConfig.AdminUsername == "" || runtimeConfig.AdminPassword == "" {
 		logger.Warn("admin username and password not set")
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
 	}
 	if login.Username != runtimeConfig.AdminUsername {
 		logger.Warn("admin username incorrect")
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
 	}
-	valid, err := verifyPassword(runtimeConfig.AdminPassword, login.Password)
+	valid, err := VerifyPassword(runtimeConfig.AdminPassword, login.Password)
 	if err != nil {
 		logger.Error("error verifying password", tint.Err(err))
 		c.JSON(
 			http.StatusInternalServerError,
 			gin.H{"error": "Internal Server Error"},
 		)
+		return
 	}
 	if !valid {
 		logger.Warn("invalid login attempt", "username", login.Username)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
 	}
 
 	session, err := h.d.api.store.New(c.Request, sessionVarName)
@@ -520,17 +460,18 @@ func (h *APIHandlers) loginHandler(c *gin.Context) {
 		ginReplyError(c, "internal server error")
 		return
 	}
-	sameSite := http.SameSiteStrictMode
-	if h.d.api.config.Development {
-		sameSite = http.SameSiteNoneMode
-	}
-	logger.Warn(fmt.Sprintf("dev mode: %v", h.d.api.config.Development))
+
 	session.Options = &gsessions.Options{
 		MaxAge:   int(h.d.api.config.SessionMaxAge.Seconds()),
-		SameSite: sameSite,
 		HttpOnly: true,
 		Secure:   true,
 	}
+	if h.d.config.Development {
+		session.Options.SameSite = http.SameSiteNoneMode
+	} else {
+		session.Options.SameSite = http.SameSiteStrictMode
+	}
+
 	session.Values[sessionVarField] = login.Username
 	err = session.Save(c.Request, c.Writer)
 	if err != nil {
@@ -540,27 +481,6 @@ func (h *APIHandlers) loginHandler(c *gin.Context) {
 	}
 	logger.Info("saved user session", "username", login.Username)
 	c.JSON(http.StatusOK, loggedInResponse{Username: login.Username})
-}
-
-// healthCheck handles the HTTP GET request for a health check.
-//
-// This function retrieves the current status of the bot, including whether it is paused,
-// the size of the request queue, and the connection status of the Discord gateway.
-// It sends this information as a JSON response.
-//
-// Parameters:
-//   - c: The Gin context for the request.
-//
-// Responses:
-//   - 200 OK: Returns the health check information in JSON format.
-func (h *APIHandlers) healthCheck(c *gin.Context) {
-	c.JSON(
-		http.StatusOK, healthCheckResponse{
-			Paused:                  h.d.paused.Load(),
-			QueueSize:               h.d.requestQueue.Len(),
-			DiscordGatewayConnected: h.d.discord.connected.Load(),
-		},
-	)
 }
 
 // logoutHandler handles the HTTP POST request to log out a user.
@@ -607,14 +527,8 @@ func (h *APIHandlers) loggedIn(c *gin.Context) {
 	username, err := h.d.api.getSessionUsername(c)
 
 	if err != nil {
-		ginContextLogger(c).Warn(
-			"error getting session username",
-			tint.Err(err),
-		)
-		c.JSON(
-			http.StatusUnauthorized,
-			httpError{Error: "unauthorized"},
-		)
+		ginContextLogger(c).Warn("error getting session username", tint.Err(err))
+		c.JSON(http.StatusUnauthorized, httpError{Error: "unauthorized"})
 		return
 	}
 	c.JSON(http.StatusOK, loggedInResponse{Username: username})
@@ -643,56 +557,6 @@ func (h *APIHandlers) discordRegisterCommands(c *gin.Context) {
 	}
 	c.JSON(http.StatusCreated, createdCommands)
 }
-
-// botPause handles the HTTP POST request to pause the DisConcierge bot.
-//
-// This function locks the configuration mutex, attempts to pause the bot,
-// and sends a response indicating whether the bot was successfully paused.
-//
-// Parameters:
-//   - c: The Gin context for the request.
-//
-// Responses:
-//   - 200 OK: If the bot was successfully paused.
-//   - 409 Conflict: If the bot is already paused.
-// func (h *APIHandlers) botPause(c *gin.Context) {
-// 	log := ginContextLogger(c)
-// 	h.d.cfgMu.Lock()
-// 	defer h.d.cfgMu.Unlock()
-//
-// 	if h.d.Pause(context.Background()) {
-// 		log.Info("bot paused")
-// 		ginReplyMessage(c, "bot paused")
-// 		return
-// 	}
-//
-// 	c.AbortWithStatusJSON(
-// 		http.StatusConflict,
-// 		httpError{Error: "bot already paused"},
-// 	)
-// }
-
-// reloadUsers handles the HTTP POST request to reload the user cache.
-//
-// This function reloads the user cache from the database and sends the updated
-// user list as a JSON response.
-//
-// Parameters:
-//   - c: The Gin context for the request.
-//
-// Responses:
-//   - 200 OK: Returns the updated list of users.
-// func (h *APIHandlers) botResume(c *gin.Context) {
-// 	h.d.cfgMu.Lock()
-// 	defer h.d.cfgMu.Unlock()
-//
-// 	ok := h.d.Resume(context.Background())
-// 	if ok {
-// 		ginReplyMessage(c, "bot resumed")
-// 		return
-// 	}
-// 	c.AbortWithStatusJSON(http.StatusConflict, httpError{Error: "bot not paused"})
-// }
 
 // reloadUsers handles the HTTP POST request to reload the user cache.
 //
@@ -750,9 +614,13 @@ func (h *APIHandlers) getUsers(c *gin.Context) {
 	var err error
 	switch pagination.Order {
 	case Descending:
-		err = h.d.db.Limit(pagination.Limit).Offset(pagination.Offset).Order("id desc").Find(&users).Error
+		err = h.d.db.Limit(pagination.Limit).Offset(
+			pagination.Offset,
+		).Order("id desc").Find(&users).Error
 	default:
-		err = h.d.db.Limit(pagination.Limit).Offset(pagination.Offset).Order("id asc").Find(&users).Error
+		err = h.d.db.Limit(pagination.Limit).Offset(
+			pagination.Offset,
+		).Order("id asc").Find(&users).Error
 	}
 	if err != nil {
 		log.Error("error getting users", tint.Err(err))
@@ -787,10 +655,7 @@ func (h *APIHandlers) getUsers(c *gin.Context) {
 	}
 	if e := g.Wait(); e != nil {
 		log.Error("error getting user stats", tint.Err(e))
-		c.JSON(
-			http.StatusInternalServerError,
-			httpError{Error: "error getting user stats"},
-		)
+		c.JSON(http.StatusInternalServerError, httpError{Error: "error getting user stats"})
 		return
 	}
 
@@ -916,9 +781,6 @@ func (h *APIHandlers) getUserHistory(c *gin.Context) {
 						return e
 					}
 					for _, rp := range reports {
-						if rp.Type == string(UserFeedbackReset) {
-							continue
-						}
 						if rp.Type == string(UserFeedbackOther) {
 							reportVals = append(reportVals, rp.Detail)
 						} else {
@@ -1017,8 +879,8 @@ func (h *APIHandlers) updateRuntimeConfig(c *gin.Context) {
 	var statusCode int
 	var ginResponse gin.H
 
-	_ = h.d.writeDB.Transaction(
-		func(tx *gorm.DB) error {
+	txnErr := h.d.writeDB.Transaction(
+		context.TODO(), func(tx *gorm.DB) error {
 			updateError = tx.Model(existingConfig).Updates(updates).Error
 			if updateError != nil {
 				statusCode = http.StatusInternalServerError
@@ -1035,6 +897,9 @@ func (h *APIHandlers) updateRuntimeConfig(c *gin.Context) {
 			return nil
 		},
 	)
+	if txnErr != nil {
+		logger.Error("error updating config", tint.Err(txnErr))
+	}
 
 	if updateError != nil {
 		h.d.runtimeConfig = &rollbackConfig
@@ -1104,11 +969,12 @@ func (h *APIHandlers) updateRuntimeConfig(c *gin.Context) {
 		logger.Error("error sending config update notification")
 	}
 
-	sent = h.d.dbNotifier.ReloadUserCache(ctx)
+	reloadCtx, reloadCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer reloadCancel()
+	sent = h.d.dbNotifier.ReloadUserCache(reloadCtx)
 	if !sent {
 		logger.Error("error sending user cache notification")
 	}
-
 }
 
 // updateUser handles the HTTP PATCH request to update a user's information.
@@ -1166,7 +1032,7 @@ func (h *APIHandlers) updateUser(c *gin.Context) {
 
 	log.Info("updating user", "user", user, "updates", updateData)
 
-	_, err = h.d.writeDB.Updates(user, updateData)
+	_, err = h.d.writeDB.Updates(context.TODO(), user, updateData)
 	if err != nil {
 		log.Error("error updating user", columnUserID, userID, tint.Err(err))
 		_ = h.d.writeDB.ReloadUser(userID)
@@ -1230,6 +1096,7 @@ func (h *APIHandlers) clearThreads(c *gin.Context) {
 	defer h.d.writeDB.UserCacheUnlock()
 
 	affected, err := h.d.writeDB.UpdatesWhere(
+		context.TODO(),
 		User{},
 		map[string]any{columnUserThreadID: nil},
 		"thread_id is not null",
@@ -1389,6 +1256,18 @@ type GetUsersQuery struct {
 //   - Descending: Sort results in descending order.
 type Sort string
 
+// userHistoryQueryParams represents the query parameters for fetching user history.
+//
+// Fields:
+//   - Sort: Specifies the sorting order for the results. It can be either ascending or descending.
+//   - Limit: Specifies the maximum number of records to return.
+//   - IncludeReports: Indicates whether to include reports in the response.
+type userHistoryQueryParams struct {
+	Sort           Sort `form:"sort" json:"sort"`
+	Limit          int  `form:"limit" json:"limit"`
+	IncludeReports bool `form:"include_reports" json:"include_reports"`
+}
+
 // apiPatchUser accepts payload to update specific fields of a User record.
 // Any non-nil value will be updated.
 //
@@ -1405,18 +1284,6 @@ type apiPatchUser struct {
 	AssistantTemperature                 *float32                   `json:"assistant_temperature,omitempty" binding:"omitnil,min=0,max=2"`
 	AssistantPollInterval                *Duration                  `json:"assistant_poll_interval,omitempty"`
 	AssistantMaxPollInterval             *Duration                  `json:"assistant_max_poll_interval,omitempty"`
-}
-
-// userHistoryQueryParams represents the query parameters for fetching user history.
-//
-// Fields:
-//   - Sort: Specifies the sorting order for the results. It can be either ascending or descending.
-//   - Limit: Specifies the maximum number of records to return.
-//   - IncludeReports: Indicates whether to include reports in the response.
-type userHistoryQueryParams struct {
-	Sort           Sort `form:"sort" json:"sort"`
-	Limit          int  `form:"limit" json:"limit"`
-	IncludeReports bool `form:"include_reports" json:"include_reports"`
 }
 
 // userHistoryItem represents a single item in a user's command history.
@@ -1500,18 +1367,6 @@ type loggedInResponse struct {
 	Username string `json:"username"`
 }
 
-// healthCheckResponse represents the response structure for a health check endpoint.
-//
-// Fields:
-//   - Paused: Indicates whether the bot is currently paused.
-//   - QueueSize: The current size of the processing queue.
-//   - DiscordGatewayConnected: Indicates whether the Discord gateway is connected.
-type healthCheckResponse struct {
-	Paused                  bool `json:"paused"`
-	QueueSize               int  `json:"queue_size"`
-	DiscordGatewayConnected bool `json:"discord_gateway_connected"`
-}
-
 // httpReply represents a standard HTTP response message.
 //
 // Fields:
@@ -1534,29 +1389,8 @@ type httpError struct {
 //   - Username: The username of the user attempting to log in.
 //   - Password: The password of the user attempting to log in.
 type userLogin struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
-}
-
-// adminSetupPayload represents the payload for the initial admin setup.
-//
-// Fields:
-//   - Username: The username for the admin account.
-//   - Password: The password for the admin account.
-//   - ConfirmPassword: The confirmation of the password to ensure it matches.
-type adminSetupPayload struct {
-	Username        string `json:"username" binding:"required"`
-	Password        string `json:"password" binding:"required,eqfield=ConfirmPassword"`
-	ConfirmPassword string `json:"confirm_password" binding:"required"`
-}
-
-// setupResponse is the response struct for the 'setup status'
-// endpoint. If an admin username/password haven't been yet,
-// Required will be true, indicating setup is needed.
-// This is used by the frontend to know when to redirect a
-// web UI user to the setup page to set the credentials.
-type setupResponse struct {
-	Required bool `json:"required"`
+	Username string `json:"username" binding:"required"`
+	Password string `json:"password" binding:"required"`
 }
 
 // authMiddleware returns a Gin middleware function for authentication.
@@ -1579,30 +1413,17 @@ func authMiddleware(d *DisConcierge) gin.HandlerFunc {
 		if logger == nil {
 			logger = slog.Default()
 		}
-		if d.pendingSetup.Load() {
-			logger.Warn("admin username and password not set")
-			c.AbortWithStatusJSON(
-				http.StatusUnauthorized,
-				httpError{Error: "unauthorized"},
-			)
-		}
 
 		session, err := store.Get(c.Request, sessionVarName)
 		if err != nil {
 			logger.Error("error getting session", tint.Err(err))
-			c.AbortWithStatusJSON(
-				http.StatusUnauthorized,
-				httpError{Error: "unauthorized"},
-			)
+			c.AbortWithStatusJSON(http.StatusUnauthorized, httpError{Error: "unauthorized"})
 			return
 		}
 
 		if session == nil {
 			logger.Error("session is nil")
-			c.AbortWithStatusJSON(
-				http.StatusUnauthorized,
-				httpError{Error: "unauthorized"},
-			)
+			c.AbortWithStatusJSON(http.StatusUnauthorized, httpError{Error: "unauthorized"})
 			return
 		}
 
@@ -1615,10 +1436,7 @@ func authMiddleware(d *DisConcierge) gin.HandlerFunc {
 				"headers",
 				c.Request.Header,
 			)
-			c.AbortWithStatusJSON(
-				http.StatusUnauthorized,
-				httpError{Error: "unauthorized"},
-			)
+			c.AbortWithStatusJSON(http.StatusUnauthorized, httpError{Error: "unauthorized"})
 			return
 		}
 
@@ -1728,30 +1546,6 @@ func ginLoggingMiddleware() gin.HandlerFunc {
 				),
 			)
 		}
-	}
-}
-
-// metricMiddleware returns a Gin middleware function for tracking API request
-// metrics.
-//
-// It increments the request count for each unique combination of HTTP
-// method and URL path.
-// The metrics are stored in the API's requestMetrics map, which is protected
-// by a mutex.
-func metricMiddleware(a *API) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		defer c.Next()
-
-		a.requestMetricsMu.Lock()
-		defer a.requestMetricsMu.Unlock()
-
-		key := fmt.Sprintf("%s %s", c.Request.Method, c.Request.URL.Path)
-		_, ok := a.requestMetrics[key]
-		if !ok {
-			a.requestMetrics[key] = 1
-			return
-		}
-		a.requestMetrics[key]++
 	}
 }
 
@@ -2691,6 +2485,41 @@ func (h *APIHandlers) getUserFeedback(c *gin.Context) {
 	)
 }
 
+func (h *APIHandlers) userFeedbackByID(c *gin.Context) {
+	logger := ginContextLogger(c)
+	id := c.Param("id")
+	userFeedbackID, err := strconv.ParseUint(id, 10, 64)
+	if err != nil {
+		logger.Error("invalid user_feedback id", tint.Err(err))
+		c.JSON(
+			http.StatusBadRequest,
+			httpError{Error: "invalid user_feedback id"},
+		)
+		return
+	}
+	logger = logger.With(slog.Group("user_feedback", "id", id))
+	logger.Info("retrieving user_feedback")
+	if id == "" {
+		c.JSON(http.StatusBadRequest, httpError{Error: "missing id parameter"})
+		return
+	}
+
+	var userFeedback UserFeedback
+	if err = h.d.db.Take(
+		&userFeedback,
+		"id = ?", userFeedbackID,
+	).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, httpError{Error: "chat command not found"})
+		} else {
+			c.JSON(http.StatusInternalServerError, httpError{Error: "error fetching chat command"})
+		}
+		return
+	}
+
+	c.JSON(http.StatusOK, userFeedback)
+}
+
 func (h *APIHandlers) getDiscordGatewayBot(c *gin.Context) {
 	gb, err := h.d.discord.session.GatewayBot(
 		discordgo.WithRetryOnRatelimit(false),
@@ -2718,11 +2547,13 @@ func updateDiscordBotStatus(
 		switch {
 		case existingConfig.Paused:
 			if !rollbackConfig.Paused {
+				statusUpdate := discordgo.UpdateStatusData{
+					AFK:    true,
+					Status: string(discordgo.StatusDoNotDisturb),
+				}
+				logger.Info("updating status", "status_update", structToSlogValue(statusUpdate))
 				if discErr := d.discord.session.UpdateStatusComplex(
-					discordgo.UpdateStatusData{
-						AFK:    true,
-						Status: string(discordgo.StatusDoNotDisturb),
-					},
+					statusUpdate,
 				); discErr != nil {
 					logger.Error("error updating discord status", tint.Err(discErr))
 				}

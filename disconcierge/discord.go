@@ -1,6 +1,7 @@
 package disconcierge
 
 import (
+	"context"
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"github.com/lmittmann/tint"
 	"log/slog"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -33,6 +35,9 @@ const (
 	// discordMaxButtonsPerActionRow defines the maximum number of buttons
 	// allowed per action row in Discord interactions.
 	discordMaxButtonsPerActionRow = 5
+
+	// discordAckTimeout is the timeframe in which an interaction must be acknowledged
+	discordAckTimeout = 3 * time.Second
 )
 
 var (
@@ -95,7 +100,7 @@ func newDiscord(config *DiscordConfig) (*Discord, error) {
 		discordgoRemoveHandlerFuncs: []func(){},
 	}
 
-	if config.WebhookServer.PublicKey != "" {
+	if config.WebhookServer.Enabled && config.WebhookServer.PublicKey != "" {
 		publicKey, err := hex.DecodeString(config.WebhookServer.PublicKey)
 		if err != nil {
 			return nil, fmt.Errorf("error decoding public key: %w", err)
@@ -215,7 +220,7 @@ func (d *Discord) handlerReady() func(
 	s *discordgo.Session,
 	r *discordgo.Ready,
 ) {
-	return func(s *discordgo.Session, r *discordgo.Ready) {
+	return func(s *discordgo.Session, _ *discordgo.Ready) {
 		d.logger.Info(
 			"Ready",
 			"session_id", s.State.SessionID,
@@ -229,7 +234,7 @@ func (d *Discord) handlerConnect() func(
 	s *discordgo.Session,
 	r *discordgo.Connect,
 ) {
-	return func(s *discordgo.Session, r *discordgo.Connect) {
+	return func(s *discordgo.Session, _ *discordgo.Connect) {
 		d.metricConnects.Add(1)
 		d.connected.Store(true)
 		var sessionID string
@@ -248,20 +253,26 @@ func (d *Discord) handlerConnect() func(
 			"session_id", sessionID,
 			slog.Group("user", "id", userID, "username", username),
 		)
-		config := d.dc.RuntimeConfig()
-		if config.DiscordNotificationChannelID != "" {
-			d.logger.Info("sending notification")
-			if sendErr := d.channelMessageSend(
-				config.DiscordNotificationChannelID,
-				d.config.StartupMessage,
-				discordgo.WithRetryOnRatelimit(false),
-				discordgo.WithRestRetries(1),
-			); sendErr != nil {
-				d.logger.Error("unable to send startup message", tint.Err(sendErr))
-			} else {
-				d.logger.Info("sent notification")
+		go func() {
+			config := d.dc.RuntimeConfig()
+			if config.DiscordNotificationChannelID != "" {
+				hctx, hcancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer hcancel()
+				d.logger.Info("sending notification")
+				if sendErr := d.channelMessageSend(
+					config.DiscordNotificationChannelID,
+					d.config.StartupMessage,
+					discordgo.WithContext(hctx),
+					discordgo.WithRetryOnRatelimit(false),
+					discordgo.WithRestRetries(1),
+				); sendErr != nil {
+					d.logger.Error("unable to send startup message", tint.Err(sendErr))
+				} else {
+					d.logger.Info("sent notification")
+				}
 			}
-		}
+		}()
+
 	}
 }
 
@@ -269,7 +280,7 @@ func (d *Discord) handlerDisconnect() func(
 	s *discordgo.Session,
 	r *discordgo.Disconnect,
 ) {
-	return func(s *discordgo.Session, r *discordgo.Disconnect) {
+	return func(s *discordgo.Session, _ *discordgo.Disconnect) {
 		d.connected.Store(false)
 		d.metricDisconnects.Add(1)
 
@@ -611,6 +622,166 @@ func (d DiscordSession) UpdateStatusComplex(
 	return d.session.UpdateStatusComplex(data)
 }
 
+// InteractionHandler defines the interface for handling Discord interactions.
+// It provides methods for responding to interactions, retrieving responses,
+// editing messages, and managing interaction lifecycle.
+//
+// Implementations of this interface are responsible for handling different
+// types of Discord interactions, such as commands, components, and modals.
+type InteractionHandler interface {
+	// Respond sends an initial response to a Discord interaction.
+	Respond(
+		ctx context.Context,
+		i *discordgo.InteractionResponse,
+		opts ...discordgo.RequestOption,
+	) error
+
+	// GetResponse retrieves the current response for an interaction.
+	GetResponse(ctx context.Context) (*discordgo.Message, error)
+
+	// Edit modifies an existing interaction response.
+	Edit(
+		ctx context.Context,
+		e *discordgo.WebhookEdit,
+		opts ...discordgo.RequestOption,
+	) (*discordgo.Message, error)
+
+	// Delete removes an interaction response.
+	Delete(ctx context.Context, opts ...discordgo.RequestOption)
+
+	// GetInteraction returns the original InteractionCreate event.
+	GetInteraction() *discordgo.InteractionCreate
+
+	// InteractionReceiveMethod returns the method used to receive the
+	// interaction (webhook or gateway).
+	InteractionReceiveMethod() DiscordInteractionReceiveMethod
+
+	// Logger returns the logger associated with this handler.
+	Logger() *slog.Logger
+
+	// Config returns the command options for this handler.
+	Config() CommandOptions
+}
+
+// GatewayHandler implements [InteractionHandler] when receiving interactions
+// via the discord websocket gateway.
+type GatewayHandler struct {
+	session     DiscordSessionHandler
+	interaction *discordgo.InteractionCreate
+	logger      *slog.Logger
+	config      CommandOptions
+	mu          *sync.RWMutex
+}
+
+func (GatewayHandler) InteractionReceiveMethod() DiscordInteractionReceiveMethod {
+	return discordInteractionReceiveMethodGateway
+}
+
+func (w GatewayHandler) Config() CommandOptions {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.config
+}
+
+func (w GatewayHandler) ChannelMessageSendReply(
+	channelID string,
+	content string,
+	reference *discordgo.MessageReference,
+	options ...discordgo.RequestOption,
+) (*discordgo.Message, error) {
+	msg, err := w.session.ChannelMessageSendReply(
+		channelID, content, reference, options...,
+	)
+	if err != nil {
+		w.logger.Error(
+			"error sending message reply",
+			tint.Err(err),
+			"channel_id", channelID,
+			"content", content,
+			"reference", reference,
+		)
+	} else {
+		w.logger.Error(
+			"sent message reply",
+			"channel_id", channelID,
+			"content", content,
+			"reference", reference,
+			"msg", msg,
+		)
+	}
+	return msg, err
+}
+
+func (w GatewayHandler) Respond(
+	ctx context.Context,
+	response *discordgo.InteractionResponse,
+	opts ...discordgo.RequestOption,
+) error {
+	err := w.session.InteractionRespond(
+		w.interaction.Interaction,
+		response,
+		opts...,
+	)
+	if err != nil {
+		w.logger.ErrorContext(ctx, "error responding to interaction", tint.Err(err))
+	} else {
+		w.logger.InfoContext(ctx, "responded to interaction")
+	}
+	return err
+}
+
+func (w GatewayHandler) GetResponse(ctx context.Context) (
+	*discordgo.Message,
+	error,
+) {
+	msg, err := w.session.InteractionResponse(
+		w.interaction.Interaction,
+		discordgo.WithContext(ctx),
+	)
+	if err != nil {
+		w.logger.ErrorContext(ctx, "error getting interaction", tint.Err(err))
+	} else {
+		w.logger.InfoContext(ctx, "got interaction response", "message", msg)
+	}
+	return msg, err
+}
+
+func (w GatewayHandler) GetInteraction() *discordgo.InteractionCreate {
+	return w.interaction
+}
+
+func (w GatewayHandler) Edit(
+	ctx context.Context,
+	wh *discordgo.WebhookEdit,
+	opts ...discordgo.RequestOption,
+) (*discordgo.Message, error) {
+	msg, err := w.session.InteractionResponseEdit(
+		w.interaction.Interaction,
+		wh,
+		opts...,
+	)
+	if err != nil {
+		w.logger.ErrorContext(ctx, "error editing interaction response", tint.Err(err))
+	} else {
+		w.logger.InfoContext(ctx, "edited interaction")
+	}
+	return msg, err
+}
+
+func (w GatewayHandler) Delete(ctx context.Context, opts ...discordgo.RequestOption) {
+	err := w.session.InteractionResponseDelete(
+		w.interaction.Interaction,
+		opts...,
+	)
+	if err != nil {
+		w.logger.ErrorContext(ctx, "error deleting interaction response", tint.Err(err))
+	}
+}
+
+func (w GatewayHandler) Logger() *slog.Logger {
+	return w.logger
+}
+
 // DiscordMessage is a DB model which logs details about an incoming discord message
 // received via the discordgo.MessageCreate handler.
 // These are generally limited to messages that solely mention
@@ -744,4 +915,54 @@ func discordModalResponse(
 			},
 		},
 	}
+}
+
+// notifyDiscordUserReachedRateLimit sends a message to the configured
+// discord notification channel, when a user has reached or exceeded
+// their rate limit.
+// If [RuntimeConfig.DiscordGatewayEnabled] is false, this is a no-op.
+// If [RuntimeConfig.DiscordNotificationChannelID] isn't set, this is a no-op.
+// If the user hasn't actually met/exceeded their limit, this is a no-op.
+func notifyDiscordUserReachedRateLimit(
+	ctx context.Context,
+	logger *slog.Logger,
+	d *Discord,
+	user *User,
+	usage ChatCommandUsage,
+	prompt string,
+	notificationChannelID string,
+) bool {
+	if usage.Billable6h < usage.Limit6h {
+		return false
+	}
+
+	if notificationChannelID == "" {
+		logger.Info("no discord notification channel set, skipping")
+		return false
+	}
+
+	if sendErr := d.channelMessageSend(
+		notificationChannelID,
+		fmt.Sprintf(
+			"User `%s` (`%s`) reached their rate limit.\n"+
+				"- **6h**: Attempted: %d / Billable: %d / Limit: %d\n"+
+				"- Available: %s"+
+				"Prompt:\n"+
+				"```\n"+
+				"%s\n"+
+				"```\n",
+			user.GlobalName,
+			user.ID,
+			usage.Attempted6h,
+			usage.Billable6h,
+			usage.Limit6h,
+			usage.CommandsAvailableAt.String(),
+			prompt,
+		),
+		discordgo.WithContext(ctx),
+	); sendErr != nil {
+		logger.Error("error sending error notification", tint.Err(sendErr))
+		return false
+	}
+	return true
 }

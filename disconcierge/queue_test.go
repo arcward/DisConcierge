@@ -3,6 +3,7 @@ package disconcierge
 import (
 	"container/heap"
 	"context"
+	"encoding/json"
 	"fmt"
 	"github.com/bwmarrin/discordgo"
 	"github.com/sashabaranov/go-openai"
@@ -10,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -190,7 +192,7 @@ func TestChatCommandQueue(t *testing.T) {
 		SleepEmpty:  1 * time.Second,
 	}
 	ctx := context.Background()
-	pq := NewChatCommandQueue(queueCfg, slog.Default())
+	pq := NewChatCommandMemoryQueue(queueCfg, slog.Default())
 
 	pushErr := pq.Push(ctx, priorityExpiredRequest, writeDB)
 	require.ErrorIsf(
@@ -263,7 +265,7 @@ func Test6HrLimit(t *testing.T) {
 	bot.requestQueue.config.SleepPaused = 1 * time.Second
 	cfg := bot.RuntimeConfig()
 	if _, err := bot.writeDB.Updates(
-		&cfg, map[string]any{
+		context.TODO(), &cfg, map[string]any{
 			columnRuntimeConfigUserChatCommandLimit6h: 2,
 		},
 	); err != nil {
@@ -295,7 +297,7 @@ func Test6HrLimit(t *testing.T) {
 			UserID:        u.ID,
 		},
 	}
-	_, err = bot.writeDB.Create(oldRequest)
+	_, err = bot.writeDB.Create(context.TODO(), oldRequest)
 	require.NoError(t, err)
 
 	cutoffRequest := &ChatCommand{
@@ -308,7 +310,7 @@ func Test6HrLimit(t *testing.T) {
 			UserID:        u.ID,
 		},
 	}
-	_, err = bot.writeDB.Create(cutoffRequest)
+	_, err = bot.writeDB.Create(context.TODO(), cutoffRequest)
 	require.NoError(t, err)
 
 	afterCutoff := &ChatCommand{
@@ -321,7 +323,7 @@ func Test6HrLimit(t *testing.T) {
 			UserID:        u.ID,
 		},
 	}
-	_, err = bot.writeDB.Create(afterCutoff)
+	_, err = bot.writeDB.Create(context.TODO(), afterCutoff)
 	require.NoError(t, err)
 
 	rejectedRequest := &ChatCommand{
@@ -340,7 +342,7 @@ func Test6HrLimit(t *testing.T) {
 	)
 	t.Cleanup(pollCancel)
 
-	if _, err = bot.writeDB.Create(rejectedRequest); err != nil {
+	if _, err = bot.writeDB.Create(context.TODO(), rejectedRequest); err != nil {
 		t.Fatal(err)
 	}
 	rejectedRequest.handler = bot.getInteractionHandlerFunc(
@@ -427,7 +429,7 @@ func Test6HrLimitIncludeIncomplete(t *testing.T) {
 	bot.requestQueue.config.SleepPaused = 1 * time.Second
 	cfg := bot.RuntimeConfig()
 	if _, err := bot.writeDB.Updates(
-		&cfg, map[string]any{
+		context.TODO(), &cfg, map[string]any{
 			columnRuntimeConfigUserChatCommandLimit6h: 2,
 		},
 	); err != nil {
@@ -464,7 +466,7 @@ func Test6HrLimitIncludeIncomplete(t *testing.T) {
 			UserID:        u.ID,
 		},
 	}
-	_, err = bot.writeDB.Create(oldRequest)
+	_, err = bot.writeDB.Create(context.TODO(), oldRequest)
 	require.NoError(t, err)
 
 	cutoffRequest := &ChatCommand{
@@ -477,7 +479,7 @@ func Test6HrLimitIncludeIncomplete(t *testing.T) {
 			UserID:        u.ID,
 		},
 	}
-	_, err = bot.writeDB.Create(cutoffRequest)
+	_, err = bot.writeDB.Create(context.TODO(), cutoffRequest)
 	require.NoError(t, err)
 
 	afterCutoff := &ChatCommand{
@@ -491,7 +493,7 @@ func Test6HrLimitIncludeIncomplete(t *testing.T) {
 			UserID:        u.ID,
 		},
 	}
-	_, err = bot.writeDB.Create(afterCutoff)
+	_, err = bot.writeDB.Create(context.TODO(), afterCutoff)
 	require.NoError(t, err)
 
 	rejectedRequest := &ChatCommand{
@@ -514,7 +516,7 @@ func Test6HrLimitIncludeIncomplete(t *testing.T) {
 	)
 	t.Cleanup(pollCancel)
 
-	if _, err = bot.writeDB.Create(rejectedRequest); err != nil {
+	if _, err = bot.writeDB.Create(context.TODO(), rejectedRequest); err != nil {
 		t.Fatal(err)
 	}
 	rejectedRequest.enqueue(
@@ -557,14 +559,15 @@ func TestChatCommandQueue_CommandExpired(t *testing.T) {
 	chatCommand, err := NewChatCommand(u, interaction)
 	require.NoError(t, err)
 
-	_, err = bot.writeDB.Create(chatCommand)
+	_, err = bot.writeDB.Create(context.TODO(), chatCommand)
 	require.NoError(t, bot.hydrateChatCommand(ctx, chatCommand))
 	bot.config.Queue.MaxAge = maxAge
 
 	_, err = bot.writeDB.Update(
+		context.TODO(),
 		chatCommand,
 		columnChatCommandCreatedAt,
-		ts.Add(-1*(maxAge*2)),
+		ts.Add(-1*(maxAge*2)).UnixMilli(),
 	)
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(ctx, 150*time.Second)
@@ -575,12 +578,6 @@ func TestChatCommandQueue_CommandExpired(t *testing.T) {
 	assert.Equal(t, ChatCommandStateExpired, chatCommand.State)
 	assert.Equal(t, ChatCommandStepEnqueue, chatCommand.Step)
 	assert.Nil(t, chatCommand.Response)
-
-	assert.Equal(t, FeedbackButtonStateHidden, chatCommand.FeedbackButtonStateOther)
-	assert.Equal(t, FeedbackButtonStateHidden, chatCommand.FeedbackButtonStateOutdated)
-	assert.Equal(t, FeedbackButtonStateHidden, chatCommand.FeedbackButtonStateReset)
-	assert.Equal(t, FeedbackButtonStateHidden, chatCommand.FeedbackButtonStateHallucinated)
-	assert.Equal(t, FeedbackButtonStateHidden, chatCommand.FeedbackButtonStateGood)
 
 	assert.Equal(t, 0, chatCommand.UsageTotalTokens)
 	assert.Equal(t, 0, chatCommand.UsagePromptTokens)
@@ -617,11 +614,12 @@ func TestChatCommandQueue_RejectOnQueuePop(t *testing.T) {
 			require.NoError(t, err)
 			chatCommand.Prompt = t.Name()
 
-			_, err = bot.writeDB.Create(chatCommand)
+			_, err = bot.writeDB.Create(context.TODO(), chatCommand)
 			require.NoError(t, bot.hydrateChatCommand(ctx, chatCommand))
 			bot.config.Queue.MaxAge = maxAge
 
 			_, err = bot.writeDB.Update(
+				context.TODO(),
 				chatCommand,
 				columnChatCommandCreatedAt,
 				ts.Add(-1*(maxAge*2)),
@@ -643,12 +641,6 @@ func TestChatCommandQueue_RejectOnQueuePop(t *testing.T) {
 			)
 			assert.Equal(t, ChatCommandStateExpired, chatCommand.State)
 			assert.Nil(t, chatCommand.Response)
-
-			assert.Equal(t, FeedbackButtonStateHidden, chatCommand.FeedbackButtonStateOther)
-			assert.Equal(t, FeedbackButtonStateHidden, chatCommand.FeedbackButtonStateOutdated)
-			assert.Equal(t, FeedbackButtonStateHidden, chatCommand.FeedbackButtonStateReset)
-			assert.Equal(t, FeedbackButtonStateHidden, chatCommand.FeedbackButtonStateHallucinated)
-			assert.Equal(t, FeedbackButtonStateHidden, chatCommand.FeedbackButtonStateGood)
 
 			assert.Equal(t, 0, chatCommand.UsageTotalTokens)
 			assert.Equal(t, 0, chatCommand.UsagePromptTokens)
@@ -674,15 +666,11 @@ func TestChatCommandQueue_RejectOnQueuePop(t *testing.T) {
 			require.NoError(t, err)
 			ignoredChatCommand.Prompt = t.Name()
 
-			_, err = bot.writeDB.Create(ignoredChatCommand)
+			_, err = bot.writeDB.Create(context.TODO(), ignoredChatCommand)
 			require.NoError(t, err)
 			require.NoError(t, bot.hydrateChatCommand(ctx, ignoredChatCommand))
 
-			_, err = bot.writeDB.Update(
-				u,
-				columnUserIgnored,
-				true,
-			)
+			_, err = bot.writeDB.Update(context.TODO(), u, columnUserIgnored, true)
 			require.NoError(t, err)
 			u = bot.writeDB.ReloadUser(u.ID)
 			ctx, cancel := context.WithTimeout(ctx, 150*time.Second)
@@ -698,20 +686,6 @@ func TestChatCommandQueue_RejectOnQueuePop(t *testing.T) {
 			)
 			assert.Equal(t, ChatCommandStateIgnored, ignoredChatCommand.State)
 			assert.Nil(t, ignoredChatCommand.Response)
-
-			assert.Equal(t, FeedbackButtonStateHidden, ignoredChatCommand.FeedbackButtonStateOther)
-			assert.Equal(
-				t,
-				FeedbackButtonStateHidden,
-				ignoredChatCommand.FeedbackButtonStateOutdated,
-			)
-			assert.Equal(t, FeedbackButtonStateHidden, ignoredChatCommand.FeedbackButtonStateReset)
-			assert.Equal(
-				t,
-				FeedbackButtonStateHidden,
-				ignoredChatCommand.FeedbackButtonStateHallucinated,
-			)
-			assert.Equal(t, FeedbackButtonStateHidden, ignoredChatCommand.FeedbackButtonStateGood)
 
 			assert.Equal(t, 0, ignoredChatCommand.UsageTotalTokens)
 			assert.Equal(t, 0, ignoredChatCommand.UsagePromptTokens)
@@ -745,4 +719,217 @@ func generatePermutations[T any](arr []T) [][]T {
 	}
 	backtrack(0)
 	return result
+}
+
+func TestWatchQueue_Reject(t *testing.T) {
+	bot, _ := newDisConcierge(t)
+
+	// Create a user
+	discordUser := newDiscordUser(t)
+	user, _, err := bot.GetOrCreateUser(context.Background(), *discordUser)
+	require.NoError(t, err)
+
+	// Start watching the queue
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
+	t.Cleanup(cancel)
+
+	go bot.watchQueue(ctx, nil)
+
+	t.Run(
+		"expired interaction", func(tt *testing.T) {
+			// Create an old chat command
+			originalMaxAge := bot.config.Queue.MaxAge
+
+			maxAge := 1 * time.Second
+			bot.config.Queue.MaxAge = maxAge
+			tt.Cleanup(
+				func() {
+					bot.config.Queue.MaxAge = originalMaxAge
+				},
+			)
+
+			oldCommand := &ChatCommand{
+				Interaction: Interaction{
+					UserID:        user.ID,
+					InteractionID: "old-interaction-id",
+					Token:         "old-token",
+					TokenExpires:  time.Now().Add(15 * time.Minute).UnixMilli(),
+					User:          user,
+				},
+				State:  ChatCommandStateQueued,
+				Prompt: "This is an old command",
+			}
+
+			// Set the creation time to be older than MaxAge
+			oldCommand.CreatedAt = time.Now().Add(-2 * maxAge).UnixMilli()
+
+			// Add the old command to the database
+			_, err = bot.writeDB.Create(context.TODO(), oldCommand)
+			require.NoError(t, err)
+
+			// Push the old command to the queue
+			bot.requestQueue.requestCh <- oldCommand
+			// err = bot.requestQueue.Push(context.Background(), oldCommand, bot.writeDB)
+			// require.NoError(t, err)
+
+			// Wait for a short period to allow the watchQueue function to process
+			time.Sleep(2 * time.Second)
+
+			// Check if the command was marked as expired
+			var updatedCommand ChatCommand
+			err = bot.db.First(
+				&updatedCommand,
+				"interaction_id = ?",
+				oldCommand.InteractionID,
+			).Error
+			require.NoError(tt, err)
+
+			assert.Equal(
+				tt,
+				ChatCommandStateExpired,
+				updatedCommand.State,
+				"Old command should be marked as expired",
+			)
+
+			// Verify that the command is no longer in the queue
+			assert.Equal(
+				tt,
+				0,
+				bot.requestQueue.Len(),
+				"Queue should be empty after discarding old command",
+			)
+		},
+	)
+	t.Run(
+		"user ignored", func(tt *testing.T) {
+			// set User.Ignored=true
+			bot.config.Queue.MaxAge = DefaultQueueMaxAge
+			user.Ignored = true
+
+			_, err = bot.writeDB.Update(context.TODO(), user, columnUserIgnored, true)
+			require.NoError(tt, err)
+
+			ignoredUserCommand := &ChatCommand{
+				Interaction: Interaction{
+					UserID:        user.ID,
+					InteractionID: "ignored-interaction-id",
+					Token:         "ignored-token",
+					TokenExpires:  time.Now().Add(15 * time.Minute).UnixMilli(),
+					User:          user,
+				},
+				State:  ChatCommandStateQueued,
+				Prompt: "This user was ignored",
+			}
+
+			// Add the old command to the database
+			_, err = bot.writeDB.Create(context.TODO(), ignoredUserCommand)
+			require.NoError(tt, err)
+
+			// Push the old command to the queue
+			bot.requestQueue.requestCh <- ignoredUserCommand
+
+			// Wait for a short period to allow the watchQueue function to process
+			time.Sleep(2 * time.Second)
+
+			// Check if the command was marked as expired
+			var updatedCommand ChatCommand
+			err = bot.db.First(
+				&updatedCommand,
+				"interaction_id = ?",
+				ignoredUserCommand.InteractionID,
+			).Error
+			require.NoError(t, err)
+
+			assert.Equal(
+				tt,
+				ChatCommandStateIgnored,
+				updatedCommand.State,
+				"Command should have been ignored",
+			)
+
+			// Verify that the command is no longer in the queue
+			assert.Equal(
+				tt,
+				0,
+				bot.requestQueue.Len(),
+				"Queue should be empty after discarding ignored command",
+			)
+		},
+	)
+
+}
+
+// TestHandleWorkerSendTimeout validates that, when a send to a
+// userCommandWorker channel times out, the ChatCommand is updated
+// appropriately, and a message is sent to the user. The message should
+// also be deleted after a default of 20 seconds, or the context passed
+// to the function is cancelled (basically flushing any goroutines waiting
+// to delete)
+func TestHandleWorkerSendTimeout(t *testing.T) {
+	bot, _ := newDisConcierge(t)
+
+	discordUser := newDiscordUser(t)
+	user, _, err := bot.GetOrCreateUser(context.Background(), *discordUser)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	t.Cleanup(cancel)
+
+	chatCommand := &ChatCommand{
+		Interaction: Interaction{
+			UserID:        user.ID,
+			InteractionID: "interaction-id",
+			Token:         "token",
+			TokenExpires:  time.Now().Add(15 * time.Minute).UnixMilli(),
+			User:          user,
+		},
+		State:  ChatCommandStateQueued,
+		Prompt: "I'm going to timeout on send!",
+	}
+
+	chatCommand.CreatedAt = time.Now().UnixMilli()
+	_, err = bot.writeDB.Create(context.TODO(), chatCommand)
+	require.NoError(t, err)
+
+	handler := newStubInteractionHandler(t)
+	chatCommand.handler = handler
+
+	wg := &sync.WaitGroup{}
+	startedAt := time.Now()
+	sendCtx, sendCancel := context.WithTimeout(ctx, 30*time.Second)
+	t.Cleanup(sendCancel)
+	bot.handleWorkerSendTimeout(sendCtx, wg, startedAt, chatCommand)
+
+	var interactionEdit *discordgo.WebhookEdit
+	select {
+	case <-ctx.Done():
+		t.Fatalf("context should not have been cancelled")
+	case ie := <-handler.callEdit:
+		interactionEdit = ie.WebhookEdit
+		break
+	}
+	require.NotNil(t, interactionEdit)
+
+	require.NotNil(t, interactionEdit.Content)
+	data, _ := json.Marshal(interactionEdit)
+	t.Logf("saw interaction: %s", string(data))
+	assert.Equal(t, bot.runtimeConfig.DiscordRateLimitMessage, *interactionEdit.Content)
+
+	require.NoError(t, bot.db.Last(&chatCommand).Error)
+
+	assert.Equal(t, ChatCommandStateRateLimited, chatCommand.State)
+	assert.Equal(t, "", chatCommand.Step.String())
+	assert.NotNil(t, chatCommand.FinishedAt)
+	assert.NotNil(t, chatCommand.StartedAt)
+	require.NotNil(t, chatCommand.Response)
+	assert.Equal(t, bot.runtimeConfig.DiscordRateLimitMessage, *chatCommand.Response)
+	sendCancel()
+
+	select {
+	case <-ctx.Done():
+		t.Fatalf("timed out")
+	case <-handler.callDelete:
+		t.Logf("saw delete")
+	}
+
 }

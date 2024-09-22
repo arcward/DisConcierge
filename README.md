@@ -18,7 +18,7 @@ web-based admin interface for configuration and monitoring.
 - Support for both **SQLite** and **PostgreSQL** databases (*Note*: SQLite
   is the default, and most tested. PostgreSQL support is experimental)
 
-![](./disconcierge-256x256.png)
+![](./docs/disconcierge-256x256.png)
 
 ## Prerequisites
 
@@ -32,155 +32,81 @@ web-based admin interface for configuration and monitoring.
 
 ## Configuration
 
-DisConcierge is primarily configured through environment variables. 
+DisConcierge is primarily configured through environment variables, or
+`.env` files (by default `.env` in the current directory, or you can
+specify one with `--config foo.env`).
 
-When running the application, the configuration can be specified as a 
-YAML file (ex: `./disconcierge --config foo.yaml run`). Example configuration:
+Example dotenv (also see [`.env.example`](./.env.example)):
 
-```yaml
-# Database connection string
-database: disconcierge.sqlite
+```env
+# General/database config
 
-# Specifies the type of database, either 'sqlite' or 'postgres'
-database_type: sqlite
+DC_DATABASE=/home/foo/disconcierge.sqlite3
+DC_DATABASE_TYPE=sqlite
+DC_DATABASE_LOG_LEVEL=INFO
+DC_DATABASE_SLOW_THRESHOLD=200ms
+DC_LOG_LEVEL=INFO
+DC_STARTUP_TIMEOUT=30s
+DC_SHUTDOWN_TIMEOUT=60s
+DC_DEVELOPMENT=true
 
-# Sets the log level for database operations
-database_log_level: INFO
+# In-memory ChatCommand queue config
 
-# The duration threshold for identifying slow database queries
-database_slow_threshold: 200ms
+DC_QUEUE_SIZE=100
+DC_QUEUE_MAX_AGE=3m
+DC_QUEUE_SLEEP_EMPTY=1s
+DC_QUEUE_SLEEP_PAUSED=5s
 
-# The base log level, for the default logger
-log_level: INFO
+# OpenAI config
 
-# Sets a limit on the amount of time the bot has to initialize/start running
-startup_timeout: 30s
+DC_OPENAI_TOKEN=your-assistant-token
+DC_OPENAI_LOG_LEVEL=INFO
+DC_OPENAI_ASSISTANT_ID=asst_byFzFiJ9P4IEzrLEOigAuppS
 
-# Time to allow for a graceful shutdown
-shutdown_timeout: 60s
+# Discord bot config
 
+DC_DISCORD_TOKEN=your-discord-bot-token
+DC_DISCORD_APPLICATION_ID=your-discord-bot-app-id
+DC_DISCORD_GUILD_ID=
+DC_DISCORD_LOG_LEVEL=WARN
+DC_DISCORD_DISCORDGO_LOG_LEVEL=WARN
+DC_DISCORD_STARTUP_MESSAGE="I'm here!"
+DC_DISCORD_GATEWAY_INTENTS=3243773
 
-# Configuration for the AskCommand queue
-queue:
-  # Maximum queue size. 0=unlimited
-  size: 100
-  # Maximum age of a request that will be returned from the queue. Requests older than this will be discarded. 0=unlimited
-  max_age: 3m
-  # Sleep for this duration when the queue is empty, before checking again
-  sleep_empty: 1s
-  # Sleep for this duration when the bot is paused, before checking again
-  sleep_paused: 5s
+# Discord webhook server
 
-# Configuration for OpenAI integration
-openai:
-  token: your_openai_token_here
-  log_level: INFO
-  assistant_id: your_assistant_id_here
+DC_DISCORD_WEBHOOK_SERVER_ENABLED=false
+DC_DISCORD_WEBHOOK_SERVER_LISTEN=127.0.0.1:5001
+DC_DISCORD_WEBHOOK_SERVER_SSL_CERT_FILE=/etc/ssl/cert.pem
+DC_DISCORD_WEBHOOK_SERVER_SSL_KEY_FILE=/etc/ssl/cert.key
+DC_DISCORD_WEBHOOK_SERVER_SSL_TLS_MIN_VERSION=771
+DC_DISCORD_WEBHOOK_SERVER_LOG_LEVEL=INFO
+DC_DISCORD_WEBHOOK_SERVER_PUBLIC_KEY=your_discord_public_key_here
+DC_DISCORD_WEBHOOK_SERVER_READ_TIMEOUT=5s
+DC_DISCORD_WEBHOOK_SERVER_READ_HEADER_TIMEOUT=5s
+DC_DISCORD_WEBHOOK_SERVER_WRITE_TIMEOUT=10s
+DC_DISCORD_WEBHOOK_SERVER_IDLE_TIMEOUT=30s
 
-# Configuration for Discord integration
-discord:
-  # Discord bot token (from the 'Bot' tab in the discord dev portal)
-  token: your_discord_token_here
-  # Discord application ID (from the 'General Information' tab in the discord dev portal)
-  application_id: your_discord_application_id_here
-  # GuildID specifies the guild ID used when registering slash commands. Leave empty for commands to be registered as global.
-  guild_id: your_discord_guild_id_here
-  # Base discord logging level
-  log_level: WARN
-  # Log level for the `discordgo` library's logger
-  discordgo_log_level: WARN
-  # Message sent to the notification channel when the bot connects to the discord gateway
-  startup_message: "I'm here!"
+# API server
 
-  # Discord gateway intents (see https://discord.com/developers/docs/topics/gateway#gateway-intents)
-  gateway_intents: 3243773
-
-  # Configuration for the Discord webhook server
-  webhook_server:
-    # Determines if the webhook server should be active
-    enabled: false
-    # The address and port on which the server should listen
-    listen: 127.0.0.1:5001
-    # The network type for listening
-    listen_network: tcp
-    # Configuration for SSL/TLS
-    ssl:
-      cert: "/etc/ssl/cert.pem"
-      key: "/etc/ssl/cert.key"
-      # 771 = TLS12
-      tls_min_version: 771
-
-    log_level: INFO
-    # The public key used for verifying Discord interaction requests
-    public_key: your_discord_public_key_here
-    # Maximum duration for reading the entire request, including the body
-    read_timeout: 5s
-    # Amount of time allowed to read request headers
-    read_header_timeout: 5s
-    # Maximum duration before timing out writes of the response
-    write_timeout: 10s
-    # Maximum amount of time to wait for the next request when keep-alives are enabled
-    idle_timeout: 30s
-
-# Configuration for the backend API server
-api:
-  # The address and port on which the server should listen
-  listen: 127.0.0.1:5000
-  # The network type for listening
-  listen_network: tcp
-  # Configuration for SSL/TLS
-  ssl:
-    cert: "/etc/ssl/cert.pem"
-    key: "/etc/ssl/cert.key"
-    # 771 = TLS12
-    tls_min_version: 771
-  # Secret used for signing cookies
-  secret: your_api_secret_here
-  log_level: INFO
-  # Cross-origin resource sharing settings
-  cors:
-    allow_origins: []
-    allow_methods:
-      - GET
-      - POST
-      - PUT
-      - PATCH
-      - DELETE
-      - OPTIONS
-      - HEAD
-    allow_headers:
-      - Origin
-      - Content-Length
-      - Content-Type
-      - Accept
-      - Authorization
-      - X-Requested-With
-      - Cache-Control
-      - X-CSRF-Token
-      - X-Request-ID
-    expose_headers:
-      - Content-Type
-      - Content-Length
-      - Accept-Encoding
-      - X-Request-ID
-      - Location
-      - ETag
-      - Authorization
-      - Last-Modified
-    allow_credentials: true
-    max_age: 12h
-  # Maximum duration for reading the entire request, including the body
-  read_timeout: 5s
-  # Amount of time allowed to read request headers
-  read_header_timeout: 5s
-  # Maximum duration before timing out writes of the response
-  write_timeout: 10s
-  # Maximum amount of time to wait for the next request when keep-alives are enabled
-  idle_timeout: 30s
-  # Max age for session cookies
-  session_max_age: 6h
-  # If true, the SameSite attribute of the session cookie will be set to 'None'
-  development: false
+DC_API_LISTEN=127.0.0.1:5000
+DC_API_EXTERNAL_URL=https://127.0.0.1:5000
+DC_API_SSL_CERT_FILE=/etc/ssl/cert.pem
+DC_API_SSL_KEY_FILE=/etc/ssl/key.pem
+DC_API_SSL_TLS_MIN_VERSION=771
+DC_API_SECRET=your-api-secret
+DC_API_LOG_LEVEL=INFO
+DC_API_CORS_ALLOW_ORIGINS=https://127.0.0.1:5000,https://localhost:5000
+DC_API_CORS_ALLOW_METHODS=GET,POST,PUT,PATCH,DELETE,OPTIONS,HEAD
+DC_API_CORS_ALLOW_HEADERS=Origin,Content-Length,Content-Type,Accept,Authorization,X-Requested-With,Cache-Control,X-CSRF-Token,X-Request-ID
+DC_API_CORS_EXPOSE_HEADERS=Content-Type,Content-Length,Accept-Encoding,X-Request-ID,Location,ETag,Authorization,Last-Modified
+DC_API_CORS_ALLOW_CREDENTIALS=true
+DC_API_CORS_MAX_AGE=12h
+DC_API_READ_TIMEOUT=5s
+DC_API_READ_HEADER_TIMEOUT=5s
+DC_API_WRITE_TIMEOUT=10s
+DC_API_IDLE_TIMEOUT=30s
+DC_API_SESSION_MAX_AGE=6h
 ```
 
 Here's a list of all configuration options that can be specified
@@ -197,13 +123,9 @@ as environment variables (* = required):
 - *`DC_DISCORD_TOKEN`: Discord bot token
 - *`DC_DISCORD_APPLICATION_ID`: Discord application ID
 - `DC_DISCORD_GUILD_ID`: Discord guild ID for registering commands (leave empty for global commands)
-- `DC_DISCORD_NOTIFICATION_CHANNEL_ID`: Channel ID for bot notifications
-- `DC_DISCORD_GATEWAY_ENABLED`: Enable Discord gateway connection (default: true)
-- `DC_DISCORD_CUSTOM_STATUS`: Custom status message for the bot
-- `DC_DISCORD_ERROR_MESSAGE`: Error message to display on Discord
-- `DC_DISCORD_RATE_LIMIT_MESSAGE`: Message to display when rate limited
 - `DC_DISCORD_LOG_LEVEL`: Log level for Discord operations
 - `DC_DISCORDGO_LOG_LEVEL`: Log level for the DiscordGo library
+- `DC_DISCORD_GATEWAY_INTENTS`: Set the gateway intents for the bot (default: 3243773)
 
 ### OpenAI Configuration
 
@@ -214,10 +136,12 @@ as environment variables (* = required):
 ### API Server Configuration
 
 - *`DC_API_LISTEN`: API server listen address (default: ":5000")
+- `DC_API_EXTERNAL_URL`: External URL for the API server. This is used in the
+  admin interface, and may be used by the bot to provide links to the admin
+  interface via Discord, if a notification channel is set.
 - `DC_API_SECRET`: Secret used to sign API session cookies
-- `DC_API_DEVELOPMENT`: Enable development mode (default: false). Sets SameSite=None for session cookies.
-- `DC_API_SSL_CERT`: Path to SSL certificate file
-- `DC_API_SSL_KEY`: Path to SSL key file
+- `DC_API_SSL_CERT_FILE`: Path to SSL certificate file
+- `DC_API_SSL_KEY_FILE`: Path to SSL key file
 - `DC_API_LOG_LEVEL`: Log level for API operations
 - `DC_API_SESSION_MAX_AGE`: Max age for session cookies (default: "6h")
 
@@ -242,6 +166,7 @@ as environment variables (* = required):
 - `DC_LOG_LEVEL`: General log level for the application
 - `DC_STARTUP_TIMEOUT`: Timeout for application startup
 - `DC_SHUTDOWN_TIMEOUT`: Timeout for graceful shutdown
+- `DC_DEVELOPMENT`: Enable development mode (default: false). Sets SameSite=None for session cookies.
 
 ## Running the Application
 
@@ -272,34 +197,22 @@ To compile, just run:
 $ make all
 ```
 
-Then, set the required environment variables and run the application:
+Set the required environment variables (either via export or
+by dotfile, by default `.env` in your current directory) as described above.
 
-   ```
-   export DC_DISCORD_TOKEN=your_discord_token
-   export DC_DISCORD_APPLICATION_ID=your_app_id
-   export DC_OPENAI_TOKEN=your_openai_token
-   export DC_OPENAI_ASSISTANT_ID=your_assistant_id
-   export DC_API_SECRET=your_api_secret
-   ./bin/disconcierge run
-   ```
+Then, create the database and set your admin credentials, followed by
+running the bot:
 
-### First-Time Setup
-
-The first time you run the application, you need to navigate
-to the admin interface (ex: `https://127.0.0.1:5000/admin`) and set
-an admin username/password before the bot will finish starting up:
-
-![](./docs/ui_setup.PNG)
-
-**Note**: If your slash commands aren't showing up in Discord (after restarting
-your client), you may need to register them again. This can be done in the
-admin interface under "Actions" -> "Register Discord Commands".
+```shell
+$ ./bin/disconcierge init
+ ...
+$ ./bin/disconcierge run
+```
 
 ## Usage
 
 Once the bot is running and invited to your Discord server (or installed 
-as a user app), you can interact 
-with it using the following slash commands:
+as a user app), you can interact with it using the following slash commands:
 
 - `/chat`: Start a conversation with the bot
 - `/private`: The same as `/chat`, but only the user invoking it can
@@ -307,9 +220,11 @@ with it using the following slash commands:
   The message/response is still logged in your configured DB by default.
 - `/clear`: Clears the conversation history / starts a new thread
 
-Access the admin interface by navigating to `https://your-server:5000/admin` in your web browser.
+Access the admin interface by navigating to `https://your-server:5000/disconcierge` in your web browser.
 
-Here's a section for the `README.md` about how the `ChatCommand` user feedback buttons work:
+**Note**: If your slash commands aren't showing up in Discord (after restarting
+your client), you may need to register them again. This can be done in the
+admin interface under "Actions" -> "Register Discord Commands".
 
 ## User Feedback System
 
@@ -317,8 +232,8 @@ DisConcierge implements a user feedback system for your OpenAI assistant's respo
 via Discord message components (buttons and modals), allowing users to provide 
 either quick feedback or more detailed feedback via a modal dialog.
 
-User feedback is visible in the admin interface at `/admin/user_feedback`
-(ex: `https://localhost:5000/admin/user_feedback`), linked to the user's Discord ID
+User feedback is visible in the admin interface at `/disconcierge/user_feedback`
+(ex: `https://localhost:5000/disconcierge/user_feedback`), linked to the user's Discord ID
 and the `/chat` (or `/private`) command that was used:
 
 ![](./docs/ui_feedback_detail.PNG)
@@ -329,54 +244,24 @@ and the `/chat` (or `/private`) command that was used:
 After each `/chat` or `/private` response (assuming the command succeeded), 
 users are presented with the following feedback options:
 
-1. 👍 ("Good"): Indicates the response was satisfactory.
-2. Outdated: Suggests the information provided is not up-to-date.
-3. Inaccurate: Indicates the response contains errors or hallucinations.
-4. Other: Allows users to provide custom feedback via a modal dialog.
+1. **Good**: Indicates the response was satisfactory.
+2. **Outdated**: Suggests the information provided is not up-to-date.
+3. **Inaccurate**: Indicates the response contains errors or hallucinations.
+4. **Other**: Allows users to provide custom feedback via a modal dialog.
 
 
 ### Feedback Behavior
 
-The behavior of the feedback system differs slightly between public channels and private contexts:
-
-#### Public Channels (`/chat` command)
-
-- Feedback buttons are visible to all users in the channel.
+- Feedback buttons are visible to all users in the channel, unless using
+  `/private` or using `/chat` in a DM to the bot.
 - Multiple users can provide feedback on the same response.
 - Feedback is stored individually for each user who responds.
-- The "Undo/Reset" option is not available for public interactions.
-
-#### Private Contexts (`/private` command or `/chat` in DMs)
-
-- Slash command responses are ephemeral, so only the user who invoked the command 
-  can see them (this includes the feedback buttons).
-- If a user selects a feedback button, it becomes disabled. If the user
-  selects the 👍 ("Good" - green) feedback button, the bad/red buttons
-  are hidden. If the user selects one of the red/bad feedback buttons, the
-  "Good" (green) button is hidden.
-- A "Reset" button appears after providing feedback, allowing users to retract 
-  their last feedback. Clicking the button resets the feedback buttons to
-  their original state, and removes the reset button.
-
-### Feedback Lifecycle
-
-1. When a response is sent, feedback buttons are added to the message.
-2. Users can click on a feedback button at any time while the buttons are active.
-3. In public channels, buttons remain visible but become disabled for a user after 
-   they've provided feedback.
-4. In private contexts, buttons update to reflect the current feedback state
-   (e.g., hiding irrelevant options after positive feedback).
-5. Feedback data is stored in the database and can be accessed through the 
-   admin interface (see above)
-
-### Timeout Behavior
-
-- Feedback buttons automatically become inactive slightly before the original Discord interaction 
-  token expires (approximately 15 minutes).
-- In both public/private channels, all buttons are removed except those buttons
-  which were selected by users. Those remaining buttons will remain visible, but
-  be disabled, preserving user feedback on the assistant's answer after the
-  window for feedback has closed.
+- When a user clicks a feedback button, a number on the button will increment
+  to confirm it was received, and to indicate the  number of users who have 
+  selected that feedback option. Selecting a button more than once has no
+  effect. The exception to this rule is the "*Other*" button, which allows
+  a user to provide detailed feedback. The *Other* button will only be incremented
+  when the modal is submitted, and users can use this button multiple times.
 
 ### Example Screenshots
 
@@ -385,18 +270,10 @@ In a "private" interaction (either via `/private` or using
 
 ![](./docs/feedback_initial.PNG)
 
-After clicking the "Good" (👍) button, a *Reset* button is added, and the 
-*Outdated*, *Inaccurate* and *Other* buttons are removed:
+After clicking the feedback buttons, the labels are incremented to show
+the number of users who have selected that feedback option:
 
-![](./docs/feedback_good.PNG)
-
-If the user clicks the *Reset* button, the feedback buttons are reset to their
-original state (showing 👍, *Outdated*, *Inaccurate* and *Other*).
-
-When the feedback window closes, all feedback buttons except those that
-were selected remain, but are disabled:
-
-![](./docs/feedback_closed.PNG)
+![](./docs/feedback_incremented.PNG)
 
 **Note**: Feedback buttons can be disabled entirely via the admin interface,
 on the config page, under the *Discord User Feedback* section:
@@ -481,43 +358,19 @@ The gist of the process:
 
 ### Configuration
 
-The DisConcierge webhook server can be enabled/configured via environment variables, or YAML.
+The DisConcierge webhook server can be enabled/configured via environment variables, or `.env` files.
 **Note**: The webhook server is disabled by default, and runs on a separate port from
 the backend API server.
 
-##### YAML Configuration
-
-```yaml
-# Configuration for Discord integration
-discord:
-  token: your_discord_token_here
-  application_id: your_discord_application_id_here
-  guild_id: optional_discord_guild_id_here
-  webhook_server:
-    enabled: true
-    listen: 127.0.0.1:5001
-    listen_network: tcp
-    # Required for verifying Discord interaction requests received via webhook
-    public_key: your_discord_public_key_here
-    ssl:
-      cert: "/etc/ssl/cert.pem"
-      key: "/etc/ssl/cert.key"
-      # 771 = TLS12, time to update this to 772 (TLS13)
-      tls_min_version: 771
-```
-
-##### Environment
-
 ```shell
-$ export DC_DISCORD_WEBHOOK_ENABLED=true
-$ export DC_DISCORD_WEBHOOK_LISTEN=127.0.0.1:5001
-$ export DC_DISCORD_WEBHOOK_LISTEN_NETWORK=tcp
-$ export DC_DISCORD_WEBHOOK_SSL_CERT="/etc/ssl/cert.pem"
-$ export DC_DISCORD_WEBHOOK_SSL_KEY="/etc/ssl/cert.key"
-$ export DC_DISCORD_WEBHOOK_PUBLIC_KEY=your_discord_bot_public_key
-$ export DC_DISCORD_TOKEN=your_discord_token
-$ export DC_DISCORD_APPLICATION_ID=your_discord_application_id
-$ export DC_DISCORD_GUILD_ID=optional_discord_guild_id
+DC_DISCORD_WEBHOOK_ENABLED=true
+DC_DISCORD_WEBHOOK_LISTEN=127.0.0.1:5001
+DC_DISCORD_WEBHOOK_SSL_CERT_FILE=/etc/ssl/cert.pem
+DC_DISCORD_WEBHOOK_SSL_KEY_FILE=/etc/ssl/cert.key
+DC_DISCORD_WEBHOOK_PUBLIC_KEY=your_discord_bot_public_key
+DC_DISCORD_TOKEN=your_discord_token
+DC_DISCORD_APPLICATION_ID=your_discord_application_id
+DC_DISCORD_GUILD_ID=optional_discord_guild_id
 ```
 
 ### Considerations/Caveats for Multiple Instances
@@ -550,7 +403,7 @@ Use a load balancer to distribute incoming webhook requests across your DisConci
 The bot's online/offline and any custom status is set via the
 Discord gateway. If the bot's gateway connection is enabled, then each instance
 will set the bot's status independently as they connect. However, an update 
-via the admin interface should trigger a single update from the instance receiving 
+via the admin interface _should_ only trigger a single update from the instance receiving 
 the update. If you disable the gateway connection, you avoid that scenario.
 Alternatively, you could run a single, separate instance with
 the gateway connection enabled to manage the bot's status (though this would require
@@ -569,6 +422,12 @@ when they complete, or indicate token usage. (If a user is limited to
 10 `/chat` commands per 6 hours, and you have 20 instances, they could potentially
 run 20 concurrent `/chat` commands, as they wouldn't yet be counted against the
 rate limit).
+
+That said, the actual behavior in this case may be unpredictable, because
+the OpenAI assistant API, while a run is in progress, is supposed to prevent
+new messages from being added to existing threads, and prevent new runs from
+being created for the thread.
+
 
 #### OpenAI API Rate Limiting
 

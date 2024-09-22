@@ -12,9 +12,16 @@ import (
 	"time"
 )
 
+// ChatCommandQueue is an interface for implementing a [ChatCommand] queue,
+// which is used by [DisConcierge] to manage incoming user requests.
 type ChatCommandQueue interface {
+	// Pop removes and returns the next [ChatCommand] from the queue.
 	Pop(context.Context) (*ChatCommand, error)
+
+	// Push adds a [ChatCommand] to the queue.
 	Push(context.Context, *ChatCommand) error
+
+	// Clear should remove all [ChatCommand] from the queue.
 	Clear(context.Context) error
 }
 
@@ -28,10 +35,7 @@ type ChatCommandMemoryQueue struct {
 	requestCh chan *ChatCommand
 }
 
-func NewChatCommandQueue(
-	config *QueueConfig,
-	logger *slog.Logger,
-) *ChatCommandMemoryQueue {
+func NewChatCommandMemoryQueue(config *QueueConfig, logger *slog.Logger) *ChatCommandMemoryQueue {
 	q := &ChatCommandMemoryQueue{
 		queue:  &PriorityQueue{},
 		logger: logger,
@@ -111,7 +115,7 @@ func (u *ChatCommandMemoryQueue) Pop(ctx context.Context) *ChatCommand {
 						req.State,
 					),
 				)
-				if reqAge > u.config.MaxAge {
+				if reqAge > u.config.MaxAge && !req.OpenAIRunInProgress() {
 					req.State = ChatCommandStateExpired
 					logger.WarnContext(
 						ctx,
@@ -125,6 +129,7 @@ func (u *ChatCommandMemoryQueue) Pop(ctx context.Context) *ChatCommand {
 						go func() {
 							defer wg.Done()
 							if _, err := u.db.Update(
+								context.TODO(),
 								req,
 								columnChatCommandState,
 								ChatCommandStateExpired,
@@ -157,6 +162,7 @@ func (u *ChatCommandMemoryQueue) Pop(ctx context.Context) *ChatCommand {
 					go func() {
 						defer wg.Done()
 						if _, err := u.db.Update(
+							context.TODO(),
 							req,
 							columnChatCommandState,
 							ChatCommandStateIgnored,
@@ -172,35 +178,14 @@ func (u *ChatCommandMemoryQueue) Pop(ctx context.Context) *ChatCommand {
 				continue
 			}
 
-			if req.State != ChatCommandStateQueued {
-				logger.WarnContext(
-					ctx,
-					fmt.Sprintf(
-						"expected state '%s', got: '%s'",
-						ChatCommandStateQueued,
-						req.State,
-					),
-					slog.Group(
-						"chat_command",
-						columnChatCommandStep,
-						req.Step,
-						columnChatCommandState,
-						req.State,
-					),
-				)
-				continue
-			}
-
 			logger.InfoContext(
 				ctx,
 				"popped request",
 				"queue_size", u.queue.Len(),
 				slog.Group(
 					"chat_command",
-					columnChatCommandStep,
-					req.Step,
-					columnChatCommandState,
-					req.State,
+					columnChatCommandStep, req.Step,
+					columnChatCommandState, req.State,
 				),
 			)
 			chatCommandCh <- req
@@ -273,6 +258,7 @@ func (u *ChatCommandMemoryQueue) Push(
 				logger.Info("discarding/aborting chat command", "chat_command", oldestReq)
 			}
 			if _, err := db.Update(
+				context.TODO(),
 				oldestReq,
 				columnChatCommandState,
 				ChatCommandStateAborted,
@@ -285,7 +271,7 @@ func (u *ChatCommandMemoryQueue) Push(
 	// using Save() instead of Update() here because the update will fail
 	// in the test suite given a zero value primary key
 	req.State = ChatCommandStateQueued
-	if _, err := db.Save(req); err != nil {
+	if _, err := db.Save(context.TODO(), req); err != nil {
 		logger.Error(
 			"failed to update request state to: %q",
 			ChatCommandStateQueued.String(),
@@ -295,14 +281,19 @@ func (u *ChatCommandMemoryQueue) Push(
 	}
 
 	reqAge := req.Age()
-	if u.config.MaxAge > 0 && reqAge > u.config.MaxAge {
+	if (u.config.MaxAge > 0 && reqAge > u.config.MaxAge) && !req.OpenAIRunInProgress() {
 		req.State = ChatCommandStateExpired
 		logger.Warn(
 			"discarding old request",
 			"max_age", u.config.MaxAge,
 			"request_age", reqAge,
 		)
-		if _, err := db.Update(req, columnChatCommandState, ChatCommandStateExpired); err != nil {
+		if _, err := db.Update(
+			context.TODO(),
+			req,
+			columnChatCommandState,
+			ChatCommandStateExpired,
+		); err != nil {
 			logger.Error("failed to update expired request", tint.Err(err))
 		}
 		return fmt.Errorf("%w: (age: %s)", ErrChatCommandTooOld, reqAge)

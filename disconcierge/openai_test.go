@@ -381,7 +381,7 @@ func TestGetMessageResponse(t *testing.T) {
 		Username: ids.Username,
 	}
 
-	_, err := writeDB.Create(discordUser)
+	_, err := writeDB.Create(context.TODO(), discordUser)
 	require.NoError(t, err)
 
 	req := &ChatCommand{
@@ -394,7 +394,7 @@ func TestGetMessageResponse(t *testing.T) {
 		},
 	}
 
-	_, err = writeDB.Create(req)
+	_, err = writeDB.Create(context.TODO(), req)
 	require.NoError(t, err)
 
 	if len(mockClient.PromptResponses) == 0 {
@@ -415,14 +415,14 @@ func TestGetMessageResponse(t *testing.T) {
 		writeDB,
 		req,
 	)
-	answer = shortenString(
+	answer = minifyString(
 		removeCitations(answer),
 		discordMaxMessageLength,
 	)
 	require.NoError(t, err)
 	assert.NotEqual(t, "", answer)
 
-	expectedMsg := shortenString(
+	expectedMsg := minifyString(
 		removeCitations(rawMsg),
 		discordMaxMessageLength,
 	)
@@ -463,7 +463,7 @@ func TestCreateMessage(t *testing.T) {
 		ID:       commandIDs.UserID,
 		Username: commandIDs.Username,
 	}
-	if _, err := writeDB.Create(user); err != nil {
+	if _, err := writeDB.Create(context.TODO(), user); err != nil {
 		t.Fatalf("error creating test user: %v", err)
 	}
 
@@ -478,7 +478,7 @@ func TestCreateMessage(t *testing.T) {
 			InteractionID: commandIDs.InteractionID,
 		},
 	}
-	if _, err := writeDB.Create(req); err != nil {
+	if _, err := writeDB.Create(context.TODO(), req); err != nil {
 		t.Fatalf("error creating test data: %v", err)
 	}
 	openAI := bot.openai
@@ -522,7 +522,7 @@ func TestRetrieveRun(t *testing.T) {
 		ID:       ids.UserID,
 		Username: ids.Username,
 	}
-	if _, err := writeDB.Create(user); err != nil {
+	if _, err := writeDB.Create(context.TODO(), user); err != nil {
 		t.Fatalf("error creating test user: %v", err)
 	}
 
@@ -536,7 +536,7 @@ func TestRetrieveRun(t *testing.T) {
 			InteractionID: ids.InteractionID,
 		},
 	}
-	if _, err := writeDB.Create(req); err != nil {
+	if _, err := writeDB.Create(context.TODO(), req); err != nil {
 		t.Fatalf("error creating test data: %v", err)
 	}
 	oo := bot.openai
@@ -1245,7 +1245,7 @@ func (m *mockOpenAIClientServer) CreateThread(
 	return thread, nil
 }
 
-func (m *mockOpenAIClientServer) GetFile(
+func (*mockOpenAIClientServer) GetFile(
 	_ context.Context,
 	_ string,
 ) (file openai.File, err error) {
@@ -1319,7 +1319,7 @@ func (m *mockOpenAIClientServer) RetrieveRun(
 	return *run, nil
 }
 
-func (m *mockOpenAIClientServer) RetrieveAssistant(
+func (*mockOpenAIClientServer) RetrieveAssistant(
 	_ context.Context,
 	_ string,
 ) (response openai.Assistant, err error) {
@@ -2618,5 +2618,78 @@ func TestOpenAI_ListRunStepsInBackground(t *testing.T) {
 		sendCancel()
 	}
 	assert.Equal(t, clearCommandResponseForgotten, clearCmdResponse)
+
+}
+
+// TestPollRun_CancelContext tests ChatCommand execution behavior, when the
+// overall bot runtime context is cancelled while the OpenAI run is in
+// the middle of being polled.
+func TestPollRun_CancelContext(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	t.Cleanup(cancel)
+
+	bot, _ := newDisConciergeWithContext(t, ctx)
+	mockClient := newMockOpenAIAssistantHandler(t)
+	mockClient.beforeReturnRunFunc = func(m *mockOpenAIClientServer, run *openai.Run) {
+		run.Status = openai.RunStatusInProgress
+	}
+	bot.openai.client = mockClient
+
+	discordUser := newDiscordUser(t)
+	ids := newCommandData(t)
+
+	mockClient.threads = map[string]openai.Thread{
+		ids.ThreadID: openai.Thread{ID: ids.ThreadID},
+	}
+	mockClient.runs = map[string]*openai.Run{
+		ids.RunID: &openai.Run{ID: ids.RunID},
+	}
+	user, _, err := bot.GetOrCreateUser(ctx, *discordUser)
+	require.NoError(t, err)
+
+	interaction := newDiscordInteraction(t, discordUser, ids.InteractionID, "where is the beef?")
+
+	req, _ := NewChatCommand(user, interaction)
+	require.NotNil(t, req)
+	req.State = ChatCommandStateInProgress
+	req.ThreadID = ids.ThreadID
+	req.RunID = ids.RunID
+	req.MessageID = ids.MessageID
+
+	require.NoError(t, bot.db.Create(req).Error)
+
+	req.handler = bot.getInteractionHandlerFunc(ctx, interaction)
+
+	select {
+	case bot.requestQueue.requestCh <- req:
+	//
+	case <-time.After(time.Minute):
+		t.Fatal("timed out sending to queue")
+	}
+
+	cctx, ccancel := context.WithTimeout(ctx, time.Minute)
+	t.Cleanup(ccancel)
+	req = waitForChatCommandRunStatus(
+		t,
+		cctx,
+		bot.db,
+		500*time.Millisecond,
+		req,
+		openai.RunStatusInProgress,
+	)
+	require.NotNil(t, req)
+	cancel()
+	select {
+	case <-bot.eventShutdown:
+	//
+	case <-time.After(5 * time.Minute):
+		t.Fatal("timed out waiting for shutdown")
+	}
+	require.NoError(t, bot.db.Last(req).Error)
+	assert.Empty(t, req.Error)
+	assert.Equal(t, ChatCommandStateInProgress, req.State)
+	assert.Equal(t, openai.RunStatusInProgress, req.RunStatus)
 
 }

@@ -13,8 +13,6 @@ import (
 )
 
 var (
-	columnRuntimeConfigAdminUsername          = "admin_username"
-	columnRuntimeConfigAdminPassword          = "admin_password"
 	columnRuntimeConfigChatCommandMaxAttempts = "chat_command_max_attempts"
 
 	columnRuntimeConfigUserChatCommandLimit6h               = "user_chat_command_limit_6h"
@@ -27,7 +25,6 @@ var (
 	columnRuntimeConfigOpenAIMaxPromptTokens                = "openai_max_prompt_tokens"
 	columnRuntimeConfigOpenAITruncationStrategyLastMessages = "openai_truncation_strategy_last_messages"
 	columnRuntimeConfigOpenAITruncationStrategyType         = "openai_truncation_strategy_type"
-	columnRuntimeConfigDiscordNotificationChannelID         = "discord_notification_channel_id"
 	columnRuntimeConfigPaused                               = "paused"
 )
 
@@ -213,7 +210,7 @@ func updateUsersFromRuntimeConfig(
 	}
 
 	return db.Transaction(
-		func(tx *gorm.DB) error {
+		context.TODO(), func(tx *gorm.DB) error {
 			// Helper function to update config and user fields
 			updateField := func(updateVal any, currentVal any, fieldName string) error {
 				if isNilPointer(updateVal) {

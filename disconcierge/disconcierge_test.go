@@ -1,15 +1,16 @@
 package disconcierge
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"github.com/bwmarrin/discordgo"
+	"github.com/gin-gonic/gin"
 	"github.com/sashabaranov/go-openai"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -20,6 +21,11 @@ import (
 	"time"
 )
 
+// TestRun is a way-too-expansive test that covers a significant
+// amount of the end-to-end stuff that happens while executing a
+// slash command. It was pretty much the first test case I wrote to
+// validate the full process, so it could probably use some cleaning
+// up or re-examination.
 func TestRun(t *testing.T) {
 	t.Parallel()
 	bot, _ := newDisConcierge(t)
@@ -43,11 +49,9 @@ func TestRun(t *testing.T) {
 		bot.getInteractionHandlerFunc(context.Background(), interaction),
 	)
 
-	doneCtx, doneCancel := context.WithTimeout(
-		context.Background(),
-		300*time.Second,
-	)
+	doneCtx, doneCancel := context.WithTimeout(context.Background(), 300*time.Second)
 	t.Cleanup(doneCancel)
+
 	discordMessage := waitForChatCommandCreation(
 		t,
 		doneCtx,
@@ -55,10 +59,7 @@ func TestRun(t *testing.T) {
 		interaction.ID,
 	)
 
-	pollCtx, pollCancel := context.WithTimeout(
-		ctx,
-		150*time.Second,
-	)
+	pollCtx, pollCancel := context.WithTimeout(ctx, 150*time.Second)
 	t.Cleanup(pollCancel)
 
 	discordMessage = waitForChatCommandFinish(
@@ -68,27 +69,18 @@ func TestRun(t *testing.T) {
 		discordMessage.InteractionID,
 	)
 	require.NotNil(t, discordMessage)
-
 	require.Equal(t, ChatCommandStateCompleted, discordMessage.State)
-
 	assert.Equal(t, discordUser.ID, discordMessage.UserID)
-
 	assert.Equal(t, interaction.ID, discordMessage.InteractionID)
 	assert.Equal(t, interaction.Token, discordMessage.Token)
 	assert.Equal(t, interaction.AppID, discordMessage.AppID)
-
 	require.NotNil(t, discordMessage.Response)
-
 	assert.Equal(t, question, discordMessage.Prompt)
-
 	assert.NotNil(t, discordMessage.Response)
 
 	response := *discordMessage.Response
 	before, after, found := strings.Cut(response, "\n\n-# Commands used:")
-	expectResponse = shortenString(
-		removeCitations(expectResponse),
-		discordMaxMessageLength,
-	)
+	expectResponse = minifyString(removeCitations(expectResponse), discordMaxMessageLength)
 	if assert.True(t, found) {
 		assert.Equal(t, expectResponse, before)
 	}
@@ -106,7 +98,6 @@ func TestRun(t *testing.T) {
 	db := bot.db
 	err := db.Find(&createRunRequests).Error
 	require.NoError(t, err)
-
 	assert.Len(t, createRunRequests, 1)
 
 	createRunReq := createRunRequests[0]
@@ -119,39 +110,33 @@ func TestRun(t *testing.T) {
 	require.NoError(t, bot.hydrateChatCommand(ctx, &chatCommandRec))
 
 	assert.Equal(t, chatCommandRec.ID, *createRunReq.ChatCommandID)
+
 	var runResponse openai.Run
 	err = json.Unmarshal([]byte(createRunReq.ResponseBody), &runResponse)
 	require.NoError(t, err)
 	assert.NotEmpty(t, chatCommandRec.ThreadID)
 	assert.Equal(t, chatCommandRec.ThreadID, runResponse.ThreadID)
 	assert.NotEmpty(t, chatCommandRec.RunID)
+
 	threadID := chatCommandRec.ThreadID
 	runID := chatCommandRec.RunID
 	var runRequestData openai.Run
 	err = json.Unmarshal([]byte(createRunReq.ResponseBody), &runRequestData)
 	require.NoError(t, err)
 	assert.Equal(t, runID, runRequestData.ID)
-
 	assert.Equal(t, threadID, runResponse.ThreadID)
-
 	assert.Equal(t, "", createRunReq.Error)
 
 	var retrieveRunReq OpenAIRetrieveRun
 	var retrieveRunResponse openai.Run
-
 	err = db.Last(&retrieveRunReq).Error
 	if err != nil {
 		t.Fatalf("error getting last chat command: %v", err)
 	}
-	err = json.Unmarshal(
-		[]byte(retrieveRunReq.ResponseBody),
-		&retrieveRunResponse,
-	)
+	err = json.Unmarshal([]byte(retrieveRunReq.ResponseBody), &retrieveRunResponse)
 	require.NoError(t, err)
-
 	assert.Equal(t, chatCommandRec.ID, *retrieveRunReq.ChatCommandID)
 	assert.Equal(t, chatCommandRec.ThreadID, retrieveRunResponse.ThreadID)
-
 	assert.Equal(t, chatCommandRec.RunID, retrieveRunResponse.ID)
 	assert.Equal(t, threadID, retrieveRunResponse.ThreadID)
 	assert.Equal(t, "", retrieveRunReq.Error)
@@ -187,6 +172,7 @@ func TestRun(t *testing.T) {
 			},
 		},
 	}
+	msg := &discordgo.Message{Content: response}
 	submitData := discordgo.ModalSubmitInteractionData{
 		CustomID: feedbackModalCustomID,
 		Components: []discordgo.MessageComponent{
@@ -195,19 +181,16 @@ func TestRun(t *testing.T) {
 	}
 	modalInteraction := &discordgo.InteractionCreate{
 		Interaction: &discordgo.Interaction{
-			Type:   discordgo.InteractionModalSubmit,
-			Data:   submitData,
-			Member: &discordgo.Member{User: discordUser},
+			Type:    discordgo.InteractionModalSubmit,
+			Data:    submitData,
+			Member:  &discordgo.Member{User: discordUser},
+			Message: msg,
 		},
 	}
 
-	reportData, err := getFeedbackTextInput(
-		db,
-		modalInteraction.ModalSubmitData(),
-	)
+	reportData, err := getFeedbackTextInput(db, modalInteraction.ModalSubmitData())
 	require.NoError(t, err)
 	require.NotNil(t, reportData)
-
 	assert.Equal(t, reportData.CustomID.String(), fullCustomID)
 
 	reportCh := make(chan struct{}, 1)
@@ -219,7 +202,6 @@ func TestRun(t *testing.T) {
 				modalInteraction,
 			),
 		)
-
 		reportCh <- struct{}{}
 	}()
 
@@ -255,39 +237,14 @@ func TestRun(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, chatCommandRec.ID, *report.ChatCommandID)
-
-	assert.Equal(t, FeedbackButtonStateEnabled, chatCommandRec.FeedbackButtonStateHallucinated)
-	assert.Equal(t, FeedbackButtonStateDisabled, chatCommandRec.FeedbackButtonStateOther)
-	assert.Equal(t, FeedbackButtonStateEnabled, chatCommandRec.FeedbackButtonStateOutdated)
-	assert.Equal(t, FeedbackButtonStateHidden, chatCommandRec.FeedbackButtonStateGood)
-	assert.Equal(t, FeedbackButtonStateEnabled, chatCommandRec.FeedbackButtonStateReset)
-
-	assert.NotNil(t, chatCommandRec.HallucinatedButton())
-	assert.NotNil(t, chatCommandRec.OtherButton())
-	assert.NotNil(t, chatCommandRec.OutdatedButton())
-	assert.NotNil(t, chatCommandRec.UndoButton())
-	assert.Nil(t, chatCommandRec.GoodButton())
-
-	err = chatCommandRec.removeUnusedFeedbackButtons(ctx, bot.writeDB)
-	require.NoError(t, err)
-
-	assert.Nil(t, chatCommandRec.HallucinatedButton())
-	assert.NotNil(t, chatCommandRec.OtherButton())
-	assert.Nil(t, chatCommandRec.OutdatedButton())
-	assert.Nil(t, chatCommandRec.UndoButton())
-	assert.Nil(t, chatCommandRec.GoodButton())
-	assert.Equal(t, FeedbackButtonStateHidden, chatCommandRec.FeedbackButtonStateHallucinated)
-	assert.Equal(t, FeedbackButtonStateDisabled, chatCommandRec.FeedbackButtonStateOther)
-	assert.Equal(t, FeedbackButtonStateHidden, chatCommandRec.FeedbackButtonStateOutdated)
-	assert.Equal(t, FeedbackButtonStateHidden, chatCommandRec.FeedbackButtonStateGood)
-	assert.Equal(t, FeedbackButtonStateHidden, chatCommandRec.FeedbackButtonStateReset)
+	assert.NotNil(t, chatCommandRec.HallucinatedButton(0))
+	assert.NotNil(t, chatCommandRec.OtherButton(0))
+	assert.NotNil(t, chatCommandRec.OutdatedButton(0))
+	assert.NotNil(t, chatCommandRec.GoodButton(0))
 
 	affected, err := bot.writeDB.Delete(&report)
-
 	require.NoError(t, err)
-	if affected != 1 {
-		t.Fatalf("expected 1 affected row, got: %d", affected)
-	}
+	require.Equal(t, int64(1), affected)
 }
 
 func TestInteractionLog(t *testing.T) {
@@ -406,7 +363,7 @@ func TestMidQueueIgnore(t *testing.T) {
 	userA, _, err := bot.GetOrCreateUser(ctx, *discordUserA)
 	require.NoError(t, err)
 
-	_, err = bot.writeDB.Update(userA, columnChatCommandPriority, true)
+	_, err = bot.writeDB.Update(context.TODO(), userA, columnChatCommandPriority, true)
 	require.NoError(t, err)
 
 	interactionA := newDiscordInteraction(
@@ -426,7 +383,7 @@ func TestMidQueueIgnore(t *testing.T) {
 	userB, _, err := bot.GetOrCreateUser(ctx, *discordUserB)
 	require.NoError(t, err)
 
-	_, err = bot.writeDB.Update(userB, columnChatCommandPriority, true)
+	_, err = bot.writeDB.Update(context.TODO(), userB, columnChatCommandPriority, true)
 	require.NoError(t, err)
 
 	interactionB := newDiscordInteraction(
@@ -446,7 +403,7 @@ func TestMidQueueIgnore(t *testing.T) {
 	userC, _, err := bot.GetOrCreateUser(ctx, *discordUserC)
 	require.NoError(t, err)
 
-	_, err = bot.writeDB.Update(userC, columnChatCommandPriority, true)
+	_, err = bot.writeDB.Update(context.TODO(), userC, columnChatCommandPriority, true)
 	require.NoError(t, err)
 
 	interactionC := newDiscordInteraction(
@@ -504,7 +461,6 @@ func TestMidQueueIgnore(t *testing.T) {
 	}
 
 	// C
-	// go bot.gatewayHandler(bot.discord.session, interactionC)
 	go bot.handleInteraction(
 		context.Background(),
 		bot.getInteractionHandlerFunc(context.Background(), interactionC),
@@ -531,6 +487,7 @@ func TestMidQueueIgnore(t *testing.T) {
 
 	// A
 	go func() {
+		// FIXME: function has assertions, shouldn't be run in a separate goroutine
 		aQueued <- waitForChatCommandState(
 			t,
 			ctx,
@@ -586,7 +543,7 @@ func TestMidQueueIgnore(t *testing.T) {
 	// Now that everything's queued while the bot is paused, we set
 	// User.Ignored for user C, then unpause the bot to allow commands
 	// to begin to process
-	_, err = bot.writeDB.Update(userC, "ignored", true)
+	_, err = bot.writeDB.Update(context.TODO(), userC, "ignored", true)
 	require.NoError(t, err)
 
 	bot.paused.Store(false)
@@ -671,7 +628,7 @@ func TestCancelContext(t *testing.T) {
 	userA, _, err := bot.GetOrCreateUser(ctx, discordUserA)
 	require.NoError(t, err)
 
-	_, err = bot.writeDB.Update(userA, columnChatCommandPriority, true)
+	_, err = bot.writeDB.Update(context.TODO(), userA, columnChatCommandPriority, true)
 	require.NoError(t, err)
 
 	interactionA := newDiscordInteraction(
@@ -710,24 +667,17 @@ func TestCancelContext(t *testing.T) {
 		t.Fatal("timed out")
 	}
 
-	queueCh := make(chan bool, 1)
-	go func() {
-		queueCh <- waitForChatCommandState(
+	stateCtx, stateCancel := context.WithTimeout(cmdCtx, 30*time.Second)
+	t.Cleanup(stateCancel)
+	require.True(
+		t, waitForChatCommandState(
 			t,
-			ctx,
+			stateCtx,
 			bot.db,
 			chatCommand.ID,
 			ChatCommandStateQueued,
-		)
-	}()
-	select {
-	case rv := <-queueCh:
-		if !rv {
-			t.Fatal("unexpected state")
-		}
-	case <-cmdCtx.Done():
-		t.Fatal("timed out")
-	}
+		),
+	)
 
 	// Set up user B, whose command will be expired when we resume
 	discordUserB := discordgo.User{
@@ -739,7 +689,7 @@ func TestCancelContext(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotEqual(t, userA.ID, userB.ID)
 
-	_, err = bot.writeDB.Update(userB, columnChatCommandPriority, true)
+	_, err = bot.writeDB.Update(context.TODO(), userB, columnChatCommandPriority, true)
 	require.NoError(t, err)
 
 	interactionB := newDiscordInteraction(
@@ -772,25 +722,18 @@ func TestCancelContext(t *testing.T) {
 		t.Fatal("timed out")
 	}
 
-	queueBCh := make(chan bool, 1)
+	bCtx, bCancel := context.WithTimeout(context.Background(), time.Minute)
+	t.Cleanup(bCancel)
+	bOK := waitForChatCommandState(
+		t,
+		ctx,
+		bot.db,
+		chatCommandB.ID,
+		ChatCommandStateQueued,
+	)
 
-	go func() {
-		queueBCh <- waitForChatCommandState(
-			t,
-			ctx,
-			bot.db,
-			chatCommandB.ID,
-			ChatCommandStateQueued,
-		)
-	}()
-	select {
-	case rv := <-queueBCh:
-		if !rv {
-			t.Fatal("unexpected state")
-		}
-	case <-cmdCtx.Done():
-		t.Fatal("timed out")
-	}
+	require.NoError(t, bCtx.Err())
+	assert.True(t, bOK)
 	// Now that both requests are queued, set the second request's
 	// expiration an hour back, so that when we resume, it's set as expired
 	tokenExpires := time.UnixMilli(chatCommandB.TokenExpires)
@@ -800,32 +743,20 @@ func TestCancelContext(t *testing.T) {
 		tokenExpires,
 		newExpiration,
 	)
-	_, err = bot.writeDB.Update(
-		&chatCommandB,
-		"token_expires",
-		newExpiration.UnixMilli(),
-	)
-	require.NoError(t, err)
 
 	// Stop the bot!
-	shutdownCtx, shutdownCancel := context.WithTimeout(
-		context.Background(),
-		320*time.Second,
-	)
-	t.Cleanup(shutdownCancel)
-	cancel()
-	shutdownComplete := make(chan struct{}, 1)
-
-	go func() {
-		<-bot.eventShutdown
-		shutdownComplete <- struct{}{}
-	}()
+	select {
+	case bot.signalStop <- struct{}{}:
+	//
+	case <-time.After(time.Minute):
+		t.Fatalf("timed out sending signal")
+	}
 
 	select {
-	case <-shutdownComplete:
-		t.Logf("shutdown complete")
-	case <-shutdownCtx.Done():
-		t.Fatal("shutdown not complete")
+	case <-bot.eventShutdown:
+	//
+	case <-time.After(time.Minute):
+		t.Fatalf("timed out waiting for shutdown")
 	}
 
 	// If we set the bot as unpaused/resumed, the value shouldn't stick.
@@ -841,6 +772,15 @@ func TestCancelContext(t *testing.T) {
 	)
 	t.Cleanup(startupCancel)
 	botErr := make(chan error, 1)
+
+	_, err = bot.writeDB.Update(
+		context.TODO(),
+		&chatCommandB,
+		"token_expires",
+		newExpiration.UnixMilli(),
+	)
+	require.NoError(t, err)
+
 	go func() {
 		botErr <- bot.Run(startupCtx)
 	}()
@@ -884,24 +824,21 @@ func TestCancelContext(t *testing.T) {
 
 	// The other ChatCommand, where we moved back the token expiration,
 	// should have been set as expired and not executed.
-	expiredCh := make(chan bool, 1)
-	go func() {
-		expiredCh <- waitForChatCommandState(
-			t,
-			resumeCtx,
-			bot.db,
-			chatCommandB.ID,
-			ChatCommandStateExpired,
-		)
-	}()
-	select {
-	case rv := <-expiredCh:
-		if !rv {
-			t.Fatal("not expected state")
-		}
-	case <-resumeCtx.Done():
-		t.Fatal("timed out")
+	expireCtx, expireCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(expireCancel)
+
+	expired := waitForChatCommandState(
+		t,
+		expireCtx,
+		bot.db,
+		chatCommandB.ID,
+		ChatCommandStateExpired,
+	)
+	require.NoError(t, expireCtx.Err())
+	if !expired {
+		t.Fatal("expected expired command")
 	}
+
 }
 
 func TestResumeFromQueuedRunStatus(t *testing.T) {
@@ -913,7 +850,7 @@ func TestResumeFromQueuedRunStatus(t *testing.T) {
 	u, _, err := bot.GetOrCreateUser(context.Background(), discordUser)
 	require.NoError(t, err)
 
-	_, err = bot.writeDB.Update(u, "ignored", true)
+	_, err = bot.writeDB.Update(context.TODO(), u, "ignored", true)
 	require.NoError(t, err)
 
 	i := newDiscordInteraction(t, &discordUser, t.Name(), "foo")
@@ -921,7 +858,7 @@ func TestResumeFromQueuedRunStatus(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, ChatCommandStateIgnored, chatCommand.State)
 	chatCommand.Acknowledged = true
-	_, err = bot.writeDB.Create(chatCommand)
+	_, err = bot.writeDB.Create(context.TODO(), chatCommand)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -948,110 +885,11 @@ func TestResumeFromQueuedRunStatus(t *testing.T) {
 	assert.True(t, chatCommand.Acknowledged)
 }
 
-func TestBotPendingSetup(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	bot, _ := newDisConciergePendingSetup(t, ctx)
-
-	if !bot.pendingSetup.Load() {
-		t.Fatalf("expected pending setup")
-	}
-
-	handlers := NewAPIHandlers(bot)
-
-	username := fmt.Sprintf("user_%s", t.Name())
-	password := fmt.Sprintf("password_%s", t.Name())
-
-	runtimeConfig := bot.RuntimeConfig()
-	assert.Empty(t, runtimeConfig.AdminPassword)
-	assert.Empty(t, runtimeConfig.AdminUsername)
-
-	rv := handleTestRequest(
-		t,
-		handlers.setupStatus,
-		http.MethodGet,
-		http.NoBody,
-	)
-	assert.Equal(t, http.StatusOK, rv.StatusCode)
-
-	var setupStatus setupResponse
-	require.NoError(t, json.NewDecoder(rv.Body).Decode(&setupStatus))
-
-	assert.True(t, setupStatus.Required)
-
-	payload := adminSetupPayload{
-		Username:        username,
-		Password:        password,
-		ConfirmPassword: fmt.Sprintf("%s-asdf", password),
-	}
-	data, err := json.Marshal(payload)
-	require.NoError(t, err)
-	rv = handleTestRequest(
-		t,
-		handlers.adminSetup,
-		http.MethodPost,
-		bytes.NewReader(data),
-	)
-	assert.Equal(t, http.StatusBadRequest, rv.StatusCode)
-
-	payload.ConfirmPassword = payload.Password
-
-	data, err = json.Marshal(payload)
-	require.NoError(t, err)
-	rv = handleTestRequest(
-		t,
-		handlers.adminSetup,
-		http.MethodPost,
-		bytes.NewReader(data),
-	)
-	assert.Equal(t, http.StatusCreated, rv.StatusCode)
-
-	tctx, tcancel := context.WithTimeout(ctx, 15*time.Second)
-
-	go func() {
-		defer tcancel()
-		for tctx.Err() == nil {
-			if !bot.pendingSetup.Load() {
-				return
-			}
-			time.Sleep(250 * time.Millisecond)
-		}
-	}()
-
-	select {
-	case <-tctx.Done():
-		if bot.pendingSetup.Load() {
-			t.Fatalf("still pending setup")
-		}
-	}
-
-	botState := bot.RuntimeConfig()
-	assert.Equal(t, payload.Username, botState.AdminUsername)
-	assert.NotEqual(t, botState.AdminPassword, password)
-	assert.NotEmpty(t, botState.AdminPassword)
-
-	login := userLogin{
-		Username: payload.Username,
-		Password: password,
-	}
-
-	data, err = json.Marshal(login)
-	require.NoError(t, err)
-
-	rv = handleTestRequest(
-		t,
-		handlers.loginHandler,
-		http.MethodPost,
-		bytes.NewReader(data),
-	)
-	assert.Equal(t, http.StatusOK, rv.StatusCode)
-}
-
 func TestHandleRecover(t *testing.T) {
 	t.Parallel()
 	bot, _ := newDisConcierge(t)
 
-	_, err := bot.writeDB.Update(bot.runtimeConfig, "recover_panic", true)
+	_, err := bot.writeDB.Update(context.TODO(), bot.runtimeConfig, "recover_panic", true)
 	require.NoError(t, err)
 
 	handler := &mockOpenAIClientServer{
@@ -1080,7 +918,7 @@ func TestHandleRecover(t *testing.T) {
 		ids.InteractionID,
 		question,
 	)
-	bctx, bcancel := context.WithTimeout(context.Background(), 15*time.Second)
+	bctx, bcancel := context.WithTimeout(context.Background(), time.Minute)
 	t.Cleanup(bcancel)
 	go bot.handleInteraction(
 		bctx,
@@ -1107,27 +945,34 @@ func setupTestDB(t testing.TB) *gorm.DB {
 	return db
 }
 
+// newDisConcierge returns a new DisConcierge for testing, with a default context.
 func newDisConcierge(t testing.TB) (*DisConcierge, *http.Client) {
 	t.Helper()
 	return newDisConciergeWithContext(t, context.Background())
 }
 
+// newDisConciergeWithContext returns a new DisConcierge for testing, with
+// test-specific default Config and RuntimeConfig structs, and mocked
+// OpenAI and Discord structs. Loggers are set which have a 'test_name'
+// field to help identify the test being run.
 func newDisConciergeWithContext(
 	t testing.TB,
 	ctx context.Context,
 ) (*DisConcierge, *http.Client) {
 	t.Helper()
+	gin.DefaultWriter = io.Discard
+
 	cfg := DefaultTestConfig(t)
-	dbctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
-	t.Cleanup(cancel)
+
 	ids := newCommandData(t)
 
 	cfg.OpenAI.AssistantID = ids.AssistantID
-
 	mockClient := newMockOpenAIClient(t, &ids)
 
+	dbctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	t.Cleanup(cancel)
 	db, err := CreateDB(dbctx, cfg.DatabaseType, cfg.Database)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	t.Cleanup(
 		func() {
 			sqlDB, _ := db.DB()
@@ -1146,30 +991,24 @@ func newDisConciergeWithContext(
 	bot.runtimeConfig = runtimeCfg
 	bot.openai.client = mockClient
 	bot.discord.session = newMockDiscordSession()
+
 	setLoggers(t, bot)
 
 	adminServer := httptest.NewTLSServer(bot.api.engine)
-
 	t.Cleanup(adminServer.Close)
-	bot.api.listener = adminServer.Listener
+
 	bot.config.HTTPClient = adminServer.Client()
 	bot.api.httpServer = adminServer.Config
-	bot.api.listener = adminServer.Listener
 
-	t.Logf(
-		"test server URL: %s",
-		adminServer.URL,
-	)
 	logger := slog.Default()
+
+	// discord API calls are mocked out, and sent into these channels so
+	// we can validate what's  being sent
 	bot.getInteractionHandlerFunc = func(
-		ctx context.Context,
-		i *discordgo.InteractionCreate,
+		_ context.Context, i *discordgo.InteractionCreate,
 	) InteractionHandler {
 		stubHandler := stubInteractionHandler{
-			callRespond: make(
-				chan *discordgo.InteractionResponse,
-				100,
-			),
+			callRespond:            make(chan *discordgo.InteractionResponse, 100),
 			config:                 bot.RuntimeConfig().CommandOptions,
 			callGetResponse:        make(chan struct{}, 100),
 			callEdit:               make(chan *stubEdits, 100),
@@ -1178,7 +1017,6 @@ func newDisConciergeWithContext(
 			callGetInteraction:     make(chan struct{}, 100),
 			callChannelMessageSend: make(chan *stubChannelMessageSend, 100),
 			GatewayHandler: GatewayHandler{
-
 				session:     bot.discord.session,
 				interaction: i,
 				logger:      logger.With("test_name", t.Name()),
@@ -1196,10 +1034,7 @@ func newDisConciergeWithContext(
 	case <-bot.signalReady:
 		t.Cleanup(
 			func() {
-				cleanupCtx, cleanupCancel := context.WithTimeout(
-					context.Background(),
-					15*time.Second,
-				)
+				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Minute)
 				defer cleanupCancel()
 				select {
 				case <-cleanupCtx.Done():
@@ -1217,128 +1052,26 @@ func newDisConciergeWithContext(
 	return bot, adminServer.Client()
 }
 
-func newDisConciergePendingSetup(
-	t testing.TB,
-	ctx context.Context,
-) (*DisConcierge, *http.Client) {
-	t.Helper()
-	cfg := DefaultTestConfig(t)
-
-	ids := newCommandData(t)
-	mockClient := newMockOpenAIClient(t, &ids)
-
-	db, err := CreateDB(ctx, cfg.DatabaseType, cfg.Database)
-	assert.NoError(t, err)
-	t.Cleanup(
-		func() {
-			sqlDB, _ := db.DB()
-			if sqlDB != nil {
-				_ = sqlDB.Close()
-			}
-		},
-	)
-
-	bot, err := New(cfg)
-	require.NoError(t, err)
-	bot.openai.client = mockClient
-	bot.discord.session = newMockDiscordSession()
-	setLoggers(t, bot)
-
-	adminServer := httptest.NewTLSServer(bot.api.engine)
-
-	t.Cleanup(adminServer.Close)
-	bot.api.listener = adminServer.Listener
-	bot.config.HTTPClient = adminServer.Client()
-	bot.api.httpServer = adminServer.Config
-	bot.api.listener = adminServer.Listener
-
-	t.Logf(
-		"test server URL: %s",
-		adminServer.URL,
-	)
-	logger := slog.Default()
-	runtimeConfig := DefaultTestRuntimeConfig(t)
-	runtimeConfig.AdminPassword = ""
-	runtimeConfig.AdminUsername = ""
-	require.NoError(t, db.Create(runtimeConfig).Error)
-
-	bot.runtimeConfig = runtimeConfig
-	bot.getInteractionHandlerFunc = func(
-		ctx context.Context,
-		i *discordgo.InteractionCreate,
-	) InteractionHandler {
-		stubHandler := stubInteractionHandler{
-			callRespond: make(
-				chan *discordgo.InteractionResponse,
-				100,
-			),
-			callGetResponse:        make(chan struct{}, 100),
-			callEdit:               make(chan *stubEdits, 100),
-			callMessageReply:       make(chan *stubMessageReply, 100),
-			callDelete:             make(chan struct{}, 100),
-			callGetInteraction:     make(chan struct{}, 100),
-			callChannelMessageSend: make(chan *stubChannelMessageSend, 100),
-			GatewayHandler: GatewayHandler{
-				session:     bot.discord.session,
-				interaction: i,
-				logger:      logger.With("test_name", t.Name()),
-			},
-			config: bot.RuntimeConfig().CommandOptions,
-		}
-		return stubHandler
-	}
-
-	botErr := make(chan error, 1)
-	go func() {
-		botErr <- bot.Run(ctx)
-	}()
-
-	pendingSetupCh := make(chan struct{}, 1)
-	tctx, tcancel := context.WithTimeout(context.Background(), 300*time.Second)
-	t.Cleanup(tcancel)
-	go func() {
-		for tctx.Err() == nil {
-			if bot.pendingSetup.Load() {
-				pendingSetupCh <- struct{}{}
-				return
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-	}()
-
-	select {
-	case <-pendingSetupCh:
-		t.Cleanup(
-			func() {
-				bot.signalStop <- struct{}{}
-			},
-		)
-	case <-tctx.Done():
-		t.Fatalf("timeout waiting for pending setup")
-	case e := <-botErr:
-		t.Fatalf("error starting bot: %v", e)
-	}
-
-	return bot, adminServer.Client()
-}
-
+// newDisConciergeWebhookWithContext returns a new DisConcierge, set up
+// to receive interactions via webhook rather than a gateway connection.
 func newDisConciergeWebhookWithContext(
 	t testing.TB,
 	ctx context.Context,
 ) (*DisConcierge, *MockDiscord) {
 	t.Helper()
+
 	cfg := DefaultTestConfig(t)
 	cfg.Discord.WebhookServer.Enabled = true
+
 	pubkey, privkey := generateDiscordKey(t)
 
 	cfg.Discord.WebhookServer.PublicKey = pubkey
 
-	ctx, cancel := context.WithTimeout(ctx, 1*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	t.Cleanup(cancel)
-	mockClient := newMockOpenAIClient(t, nil)
 
 	db, err := CreateDB(ctx, cfg.DatabaseType, cfg.Database)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	t.Cleanup(
 		func() {
 			sqlDB, _ := db.DB()
@@ -1348,37 +1081,29 @@ func newDisConciergeWebhookWithContext(
 		},
 	)
 
-	runtimeCfg := DefaultTestRuntimeConfig(t)
-	require.NoError(t, db.Create(runtimeCfg).Error)
-
 	bot, err := New(cfg)
 	require.NoError(t, err)
+
+	runtimeCfg := DefaultTestRuntimeConfig(t)
+	require.NoError(t, db.Create(runtimeCfg).Error)
 	bot.runtimeConfig = runtimeCfg
 
 	bot.discord.session = newMockDiscordSession()
 
 	setLoggers(t, bot)
 
+	mockClient := newMockOpenAIClient(t, nil)
 	bot.openai.client = mockClient
 
 	webhookServer := httptest.NewTLSServer(bot.discordWebhookServer.engine)
 	t.Cleanup(webhookServer.Close)
 	bot.discordWebhookServer.httpServer = webhookServer.Config
-	bot.discordWebhookServer.listener = webhookServer.Listener
-	bot.discordWebhookServer.httpServerURL = webhookServer.URL
 
 	adminServer := httptest.NewTLSServer(bot.api.engine)
-
 	t.Cleanup(adminServer.Close)
-	bot.api.listener = adminServer.Listener
 	bot.config.HTTPClient = adminServer.Client()
 	bot.api.httpServer = adminServer.Config
-	bot.api.listener = adminServer.Listener
 
-	t.Logf(
-		"test server URL: %s ",
-		adminServer.URL,
-	)
 	logger := slog.Default()
 	mockDiscord := &MockDiscord{
 		PrivateKey: privkey,
@@ -1392,14 +1117,11 @@ func newDisConciergeWebhookWithContext(
 	}
 
 	bot.getInteractionHandlerFunc = func(
-		ctx context.Context,
+		_ context.Context,
 		i *discordgo.InteractionCreate,
 	) InteractionHandler {
 		stubHandler := stubInteractionHandler{
-			callRespond: make(
-				chan *discordgo.InteractionResponse,
-				100,
-			),
+			callRespond:            make(chan *discordgo.InteractionResponse, 100),
 			config:                 bot.RuntimeConfig().CommandOptions,
 			callMessageReply:       make(chan *stubMessageReply, 100),
 			callGetResponse:        make(chan struct{}, 100),
@@ -1408,8 +1130,7 @@ func newDisConciergeWebhookWithContext(
 			callGetInteraction:     make(chan struct{}, 100),
 			callChannelMessageSend: make(chan *stubChannelMessageSend, 100),
 			GatewayHandler: GatewayHandler{
-				session: bot.discord.session,
-				// session:     &discordgo.Session{},
+				session:     bot.discord.session,
 				interaction: i,
 				logger:      logger.With("test_name", t.Name()),
 			},
@@ -1432,7 +1153,6 @@ func newDisConciergeWebhookWithContext(
 	case e := <-botErr:
 		t.Fatalf("error starting bot: %v", e)
 	}
-
 	return bot, mockDiscord
 }
 
@@ -1449,10 +1169,9 @@ func newTestDisConcierge(t testing.TB, ids *commandData) (
 	}
 
 	cfg := DefaultTestConfig(t)
-	mockClient := newMockOpenAIClient(t, nil)
 
 	db, err := CreateDB(context.Background(), cfg.DatabaseType, cfg.Database)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	t.Cleanup(
 		func() {
 			sqlDB, _ := db.DB()
@@ -1472,29 +1191,26 @@ func newTestDisConcierge(t testing.TB, ids *commandData) (
 
 	setLoggers(t, bot)
 
+	mockClient := newMockOpenAIClient(t, nil)
 	bot.openai.client = mockClient
 
 	bot.openai.assistant = &openai.Assistant{}
 
 	adminServer := httptest.NewTLSServer(bot.api.engine)
 	t.Cleanup(adminServer.Close)
-	bot.api.listener = adminServer.Listener
+
 	bot.config.HTTPClient = adminServer.Client()
 	bot.api.httpServer = adminServer.Config
-	bot.api.listener = adminServer.Listener
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
 	bot.getInteractionHandlerFunc = func(
-		ctx context.Context,
+		_ context.Context,
 		i *discordgo.InteractionCreate,
 	) InteractionHandler {
 		stubHandler := stubInteractionHandler{
-			callRespond: make(
-				chan *discordgo.InteractionResponse,
-				100,
-			),
+			callRespond:            make(chan *discordgo.InteractionResponse, 100),
 			config:                 bot.RuntimeConfig().CommandOptions,
 			callGetResponse:        make(chan struct{}, 100),
 			callEdit:               make(chan *stubEdits, 100),
@@ -1689,10 +1405,10 @@ func TestHandleDiscordMessage(t *testing.T) {
 				Content:   *chatCommand.Response,
 				Author:    appUser,
 			}
-			_, err := bot.writeDB.Create(chatCommand.User)
+			_, err := bot.writeDB.Create(context.TODO(), chatCommand.User)
 			require.NoError(t, err)
 
-			_, err = bot.writeDB.Create(chatCommand)
+			_, err = bot.writeDB.Create(context.TODO(), chatCommand)
 			require.NoError(t, err)
 			require.Empty(t, chatCommand.DiscordMessageID)
 			require.NotEmpty(t, chatCommand.InteractionID)
@@ -1763,7 +1479,7 @@ func TestHandleDiscordMessage(t *testing.T) {
 			// Create and set the user as ignored
 			dbUser, _, err := bot.GetOrCreateUser(ctx, *ignoredUser)
 			require.NoError(t, err)
-			_, err = bot.writeDB.Update(dbUser, "ignored", true)
+			_, err = bot.writeDB.Update(context.TODO(), dbUser, "ignored", true)
 			require.NoError(t, err)
 
 			msg := &discordgo.MessageCreate{
@@ -1824,7 +1540,7 @@ func TestDisConcierge_New_InvalidDatabaseType(t *testing.T) {
 	cfg := DefaultTestConfig(t)
 	cfg.DatabaseType = dbType
 	_, err := New(cfg)
-	require.NotNil(t, err)
+	require.Error(t, err)
 	require.ErrorContains(t, err, "invalid database type")
 }
 

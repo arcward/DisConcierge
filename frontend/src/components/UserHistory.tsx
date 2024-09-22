@@ -23,11 +23,6 @@ const UserHistoryList = (props: UserModel) => {
     const [alertSeverity, setAlertSeverity] = React.useState('info');
     const [alertMsg, setAlertMsg] = useState('');
 
-    const handleClose = (event: any) => {
-        setAlertOpen(false);
-        setAlertMsg('');
-    };
-
 
     const setAlertError = (msg: string) => {
         setAlertSeverity('error');
@@ -53,7 +48,6 @@ const UserHistoryList = (props: UserModel) => {
                 setLoading(false);
             }
         };
-
         fetchUserHistory();
     }, []);
 

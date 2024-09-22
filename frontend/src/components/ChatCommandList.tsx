@@ -1,12 +1,8 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, {useCallback, useEffect, useState} from 'react';
 import {
     Box,
     Button,
     CircularProgress,
-    Dialog,
-    DialogActions,
-    DialogContent,
-    DialogTitle,
     Paper,
     Table,
     TableBody,
@@ -14,20 +10,19 @@ import {
     TableContainer,
     TableHead,
     TableRow,
-    TextField,
     Tooltip,
     Typography,
-} from '@mui/material';
-import ChatCommand from '../models/ChatCommand';
-import api from '../api/apiClient';
+}                                                from '@mui/material';
+import ChatCommand                               from '../models/ChatCommand';
+import api                                       from '../api/apiClient';
+import {useNavigate}                             from "react-router-dom";
 
 const ChatCommandsList: React.FC = () => {
+    const history = useNavigate();
     const [chatCommands, setChatCommands] = useState<ChatCommand[]>([]);
     const [loading, setLoading] = useState(true);
     const [offset, setOffset] = useState(0);
     const [hasMore, setHasMore] = useState(true);
-    const [openModal, setOpenModal] = useState(false);
-    const [selectedCommand, setSelectedCommand] = useState<ChatCommand | null>(null);
 
     const LIMIT = 25; // Number of items to fetch per request
 
@@ -55,16 +50,6 @@ const ChatCommandsList: React.FC = () => {
     const handleLoadMore = () => {
         setOffset(prevOffset => prevOffset + LIMIT);
         fetchChatCommands(true);
-    };
-
-    const handleOpenModal = (command: ChatCommand) => {
-        setSelectedCommand(command);
-        setOpenModal(true);
-    };
-
-    const handleCloseModal = () => {
-        setOpenModal(false);
-        setSelectedCommand(null);
     };
 
     const truncateText = (text: string | null | undefined, maxLength: number) => {
@@ -110,7 +95,8 @@ const ChatCommandsList: React.FC = () => {
                                 </TableCell>
                                 <TableCell>{command.state}</TableCell>
                                 <TableCell>
-                                    <Button variant="outlined" onClick={() => handleOpenModal(command)}>
+                                    <Button variant="outlined"
+                                            onClick={() => history(`/chat_command/${command.id}`)}>
                                         View Details
                                     </Button>
                                 </TableCell>
@@ -132,76 +118,6 @@ const ChatCommandsList: React.FC = () => {
                 </Box>
             )}
 
-            <Dialog open={openModal} onClose={handleCloseModal} maxWidth="md" fullWidth>
-                <DialogTitle>Chat Command Details</DialogTitle>
-                <DialogContent>
-                    {selectedCommand && (
-                        <Box>
-                            <TextField
-                                label="Content"
-                                multiline
-                                fullWidth
-                                InputProps={{
-                                    readOnly: true,
-                                    style: { height: '100px', overflowY: 'auto' }
-                                }}
-                                value={selectedCommand.content || 'N/A'}
-                                margin="normal"
-                                variant="outlined"
-                            />
-                            <TextField
-                                label="Prompt"
-                                multiline
-                                fullWidth
-                                InputProps={{
-                                    readOnly: true,
-                                    style: { height: '100px', overflowY: 'auto' }
-                                }}
-                                value={selectedCommand.prompt || 'N/A'}
-                                margin="normal"
-                                variant="outlined"
-                            />
-                            <TextField
-                                label="Response"
-                                multiline
-                                fullWidth
-                                InputProps={{
-                                    readOnly: true,
-                                    style: { height: '100px', overflowY: 'auto' }
-                                }}
-                                value={selectedCommand.response || 'N/A'}
-                                margin="normal"
-                                variant="outlined"
-                            />
-                            <TextField
-                                label="User"
-                                multiline
-                                fullWidth
-                                InputProps={{
-                                    readOnly: true,
-                                    style: { height: '100px', overflowY: 'auto' }
-                                }}
-                                value={JSON.stringify(selectedCommand.user, null, 2) || 'N/A'}
-                                margin="normal"
-                                variant="outlined"
-                            />
-                            {Object.entries(selectedCommand).map(([key, value]) => {
-                                if (!['content', 'prompt', 'response', 'user'].includes(key)) {
-                                    return (
-                                        <Typography key={key} variant="body1" gutterBottom>
-                                            <strong>{key}:</strong> {JSON.stringify(value)}
-                                        </Typography>
-                                    );
-                                }
-                                return null;
-                            })}
-                        </Box>
-                    )}
-                </DialogContent>
-                <DialogActions>
-                    <Button onClick={handleCloseModal}>Close</Button>
-                </DialogActions>
-            </Dialog>
         </Box>
     );
 };

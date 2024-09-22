@@ -9,8 +9,6 @@ import (
 	"time"
 )
 
-type ClearCommandState string
-
 const (
 	ClearCommandStateReceived  ClearCommandState = "received"
 	ClearCommandStateFailed    ClearCommandState = "failed"
@@ -29,15 +27,15 @@ var (
 	// in progress.
 	// TODO set this via RuntimeConfig
 	clearCommandResponseTooSoon = "I just did that!"
-)
 
-var (
 	columnClearCommandState      = "state"
 	columnClearCommandFinishedAt = "finished_at"
 	columnClearCommandResponse   = "response"
 	columnClearCommandError      = "error"
 	columnClearCommandStartedAt  = "started_at"
 )
+
+type ClearCommandState string
 
 // ClearCommand represents a '/clear' slash command execution in the DisConcierge bot.
 //
@@ -80,8 +78,11 @@ func NewUserClearCommand(
 		State:       ClearCommandStateReceived,
 	}
 	rec.logger = d.logger.With("clear_command", rec)
-
 	return rec
+}
+
+func (c *ClearCommand) Deadline() time.Time {
+	return time.UnixMilli(c.TokenExpires).UTC()
 }
 
 func (c ClearCommand) LogValue() slog.Value {
@@ -141,7 +142,7 @@ func (c *ClearCommand) execute(
 		columnClearCommandState:     ClearCommandStateCompleted,
 	}
 	originalThreadID := c.User.ThreadID
-	_, err := dc.writeDB.Update(c.User, columnUserThreadID, nil)
+	_, err := dc.writeDB.Update(context.TODO(), c.User, columnUserThreadID, nil)
 
 	wg := &sync.WaitGroup{}
 	defer wg.Wait()
@@ -158,6 +159,7 @@ func (c *ClearCommand) execute(
 			_, editErr := c.handler.Edit(
 				ctx,
 				&discordgo.WebhookEdit{Content: &config.DiscordErrorMessage},
+				discordgo.WithContext(ctx),
 			)
 			if editErr != nil {
 				cmdLogger.ErrorContext(ctx, "error updating interaction", tint.Err(editErr))
@@ -179,6 +181,7 @@ func (c *ClearCommand) execute(
 			_, editErr := c.handler.Edit(
 				ctx,
 				&discordgo.WebhookEdit{Content: &clearCommandResponseForgotten},
+				discordgo.WithContext(ctx),
 			)
 			if editErr != nil {
 				cmdLogger.ErrorContext(ctx, "error updating interaction", tint.Err(editErr))
@@ -192,7 +195,7 @@ func (c *ClearCommand) execute(
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if _, e := dc.writeDB.Updates(c, updates); e != nil {
+		if _, e := dc.writeDB.Updates(context.TODO(), c, updates); e != nil {
 			cmdLogger.ErrorContext(ctx, "error updating clear command", tint.Err(e))
 		}
 	}()

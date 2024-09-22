@@ -7,11 +7,10 @@ export interface IUserHistory {
     error?: string;
     state: string;
     step: string;
-    created_at: string; // Date is represented as string in JSON
+    created_at: string;
     run_id: string;
     thread_id: string;
     run_status: string;
-    // rate_limited: boolean;
     chat_command_id: number;
     interaction_id: string;
     context: string;
@@ -33,7 +32,6 @@ export class UserHistoryModel implements IUserHistory {
     step: string;
     thread_id: string;
     run_status: string;
-    // rate_limited: boolean;
 
     interaction_id: string;
     context: string;
@@ -53,7 +51,6 @@ export class UserHistoryModel implements IUserHistory {
         this.run_status = data.run_status || '';
         this.state = data.state || '';
         this.step = data.step || '';
-        // this.rate_limited = data.rate_limited || false;
         this.chat_command_id = data.chat_command_id || 0;
         this.interaction_id = data.interaction_id || '';
         this.context = data.context || '';

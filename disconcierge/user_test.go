@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/bwmarrin/discordgo"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"log/slog"
 	"testing"
 	"time"
@@ -16,7 +17,7 @@ func TestTokenUsageSince(t *testing.T) {
 	cfg := DefaultTestConfig(t)
 
 	db, err := CreateDB(context.Background(), cfg.DatabaseType, cfg.Database)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	t.Cleanup(
 		func() {
 			sqlDB, _ := db.DB()
@@ -195,14 +196,13 @@ func TestUpdateChatCommandStateAndDeleteInteraction(t *testing.T) {
 	}
 }
 
-// Mock database
 type mockDatabase struct {
 	updateCalled bool
 	updateError  error
 	DBI
 }
 
-func (m *mockDatabase) Update(model any, _ string, value any) (int64, error) {
+func (m *mockDatabase) Update(_ context.Context, model any, _ string, value any) (int64, error) {
 	m.updateCalled = true
 	if m.updateError != nil {
 		return 0, m.updateError
@@ -213,16 +213,12 @@ func (m *mockDatabase) Update(model any, _ string, value any) (int64, error) {
 	return 1, nil
 }
 
-// Mock interaction handler
 type mockInteractionHandler struct {
 	InteractionHandler
 	deleteCalled bool
 }
 
-func (m *mockInteractionHandler) Delete(
-	_ context.Context,
-	_ ...discordgo.RequestOption,
-) {
+func (m *mockInteractionHandler) Delete(_ context.Context, _ ...discordgo.RequestOption) {
 	m.deleteCalled = true
 }
 
