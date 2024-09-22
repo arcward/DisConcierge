@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"github.com/arcward/disconcierge/disconcierge"
+	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/sqlite"
@@ -14,6 +15,13 @@ import (
 )
 
 func TestInitCommand(t *testing.T) {
+	t.Cleanup(
+		func() {
+			viper.Reset()
+			cfg = disconcierge.DefaultConfig()
+		},
+	)
+
 	tempDir := t.TempDir()
 	dbPath := filepath.Join(tempDir, "test.db")
 

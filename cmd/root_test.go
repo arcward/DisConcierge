@@ -18,6 +18,7 @@ import (
 
 func TestLoadConfigFromEnvFile(t *testing.T) {
 	// Save the original environment
+
 	originalEnv := os.Environ()
 	t.Cleanup(
 		func() {
@@ -28,9 +29,12 @@ func TestLoadConfigFromEnvFile(t *testing.T) {
 			}
 		},
 	)
-
-	// Clear the environment before the test
-	os.Clearenv()
+	t.Cleanup(
+		func() {
+			viper.Reset()
+			cfg = disconcierge.DefaultConfig()
+		},
+	)
 
 	tmpdir := t.TempDir()
 

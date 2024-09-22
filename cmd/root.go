@@ -144,8 +144,8 @@ func initConfig() {
 	viper.SetDefault("runtime_config_ttl", disconcierge.DefaultRuntimeConfigTTL)
 	viper.SetDefault("user_cache_ttl", disconcierge.DefaultUserCacheTTL)
 
-	viper.SetDefault("log_level", disconcierge.DefaultLogLevel)
-	viper.SetDefault("api.log_level", disconcierge.DefaultAPILogLevel)
+	viper.SetDefault("log_level", disconcierge.DefaultLogLevel.String())
+	viper.SetDefault("api.log_level", disconcierge.DefaultAPILogLevel.String())
 
 	viper.SetDefault("startup_timeout", disconcierge.DefaultStartupTimeout)
 	viper.SetDefault("shutdown_timeout", disconcierge.DefaultShutdownTimeout)
@@ -209,7 +209,7 @@ func initConfig() {
 	)
 	viper.SetDefault(
 		"discord.webhook_server.log_level",
-		disconcierge.DefaultDiscordWebhookLogLevel,
+		disconcierge.DefaultDiscordWebhookLogLevel.String(),
 	)
 
 	fatalErr := func(err error) {
@@ -301,45 +301,48 @@ func initConfig() {
 		viper.GetStringSlice("api.cors.expose_headers"),
 	)
 
+	for k, v := range viper.AllSettings() {
+		log.Printf("config: %s: %v", k, v)
+	}
 	logLevelVar, err := levelStringToLevelVar(viper.GetString("log_level"))
 	if err != nil {
-		log.Fatalf("error parsing log level: %v", err)
+		log.Fatalf("error parsing log_level: %v", err)
 	}
 	viper.Set("log_level", logLevelVar)
 
 	logLevelVar, err = levelStringToLevelVar(viper.GetString("discord.log_level"))
 	if err != nil {
-		log.Fatalf("error parsing log level: %v", err)
+		log.Fatalf("error parsing discord log level: %v", err)
 	}
 	viper.Set("discord.log_level", logLevelVar)
 
 	logLevelVar, err = levelStringToLevelVar(viper.GetString("openai.log_level"))
 	if err != nil {
-		log.Fatalf("error parsing log level: %v", err)
+		log.Fatalf("error parsing openai log level: %v", err)
 	}
 	viper.Set("openai.log_level", logLevelVar)
 
 	logLevelVar, err = levelStringToLevelVar(viper.GetString("discord.discordgo_log_level"))
 	if err != nil {
-		log.Fatalf("error parsing log level: %v", err)
+		log.Fatalf("error parsing discordgo log level: %v", err)
 	}
 	viper.Set("discord.discordgo_log_level", logLevelVar)
 
 	logLevelVar, err = levelStringToLevelVar(viper.GetString("database_log_level"))
 	if err != nil {
-		log.Fatalf("error parsing log level: %v", err)
+		log.Fatalf("error parsing database log level: %v", err)
 	}
 	viper.Set("database_log_level", logLevelVar)
 
 	logLevelVar, err = levelStringToLevelVar(viper.GetString("api.log_level"))
 	if err != nil {
-		log.Fatalf("error parsing log level: %v", err)
+		log.Fatalf("error parsing api log level: %v", err)
 	}
 	viper.Set("api.log_level", logLevelVar)
 
 	logLevelVar, err = levelStringToLevelVar(viper.GetString("discord.webhook_server.log_level"))
 	if err != nil {
-		log.Fatalf("error parsing log level: %v", err)
+		log.Fatalf("error parsing webhook server log level: %v", err)
 	}
 	viper.Set("discord.webhook_server.log_level", logLevelVar)
 
