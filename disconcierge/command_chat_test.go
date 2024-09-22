@@ -867,6 +867,10 @@ func TestChatCommand_HandleError(t *testing.T) {
 	bot, _, _ := newTestDisConcierge(t, nil)
 	ctx := context.Background()
 
+	discordUser := newDiscordUser(t)
+	user, _, err := bot.GetOrCreateUser(ctx, *discordUser)
+	require.NoError(t, err)
+
 	tests := []struct {
 		name               string
 		initialAttempts    int
@@ -911,9 +915,14 @@ func TestChatCommand_HandleError(t *testing.T) {
 		t.Run(
 			tt.name, func(t *testing.T) {
 				chatCommand := &ChatCommand{
-					Attempts:    tt.initialAttempts,
-					Interaction: Interaction{TokenExpires: tt.tokenExpires},
-					State:       ChatCommandStateQueued,
+					Attempts: tt.initialAttempts,
+					Interaction: Interaction{
+						InteractionID: tt.name,
+						TokenExpires:  tt.tokenExpires,
+						User:          user,
+						UserID:        user.ID,
+					},
+					State: ChatCommandStateQueued,
 				}
 
 				mockHandler := newStubInteractionHandler(t)
@@ -921,6 +930,8 @@ func TestChatCommand_HandleError(t *testing.T) {
 				cmdConfig.ChatCommandMaxAttempts = tt.maxAttempts
 				mockHandler.config = cmdConfig
 				chatCommand.handler = mockHandler
+				_, err = bot.writeDB.Create(context.Background(), chatCommand)
+				require.NoError(t, err)
 
 				chatCommand.handleError(ctx, bot)
 

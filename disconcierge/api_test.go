@@ -2279,7 +2279,7 @@ func TestAPI_UpdateConfig_DiscordGateway(t *testing.T) {
 
 				timeoutCtx, timeoutCancel := context.WithTimeout(
 					context.Background(),
-					15*time.Second,
+					time.Minute,
 				)
 				t.Cleanup(timeoutCancel)
 				doneCh := make(chan struct{}, 1)

@@ -79,7 +79,7 @@ func TestInitCommand(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = os.Stat(dbPath)
-	assert.NoError(t, err, "Database file should exist")
+	require.NoError(t, err, "Database file should exist")
 
 	// Verify the output
 	output := out.String()
