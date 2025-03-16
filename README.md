@@ -4,6 +4,18 @@ DisConcierge is a Discord bot that allows users to interact with
 OpenAI assistants via Discord slash commands. It also features a
 web-based admin interface for configuration and monitoring.
 
+## Use Cases
+
+This project was developed with two primary uses cases in mind:
+
+- **Community support**: Deploy DisConcierge in your community server to answer frequently asked questions,
+  provide documentation references, and help new members. The feedback system allows you to track
+  response quality and improve the assistant over time.
+
+- **Knowledge base access**: Configure your OpenAI assistant with relevant documentation/files and
+  give your community/channel access to your knowledge base (product/service info, internal processes, etc)
+  through natural language queries.
+
 ## Features
 
 - Discord slash commands (`/chat` and `/private`) to interact with your OpenAI assistant
